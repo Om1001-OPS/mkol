@@ -1,0 +1,593 @@
+import os
+import requests
+from google.cloud import firestore
+import firebase_admin
+from firebase_admin import credentials
+import re
+
+# --- CONFIGURATION ---
+FIREBASE_API_KEY = "AIzaSyBLHn106tlG9gcmM0zfcYWZJ03dnWKb4yg"  # <-- Replace with your project's API key
+SERVICE_ACCOUNT_PATH = "firestore-key.json"  # Ensure this is in your project folder
+
+# --- INITIALIZE FIRESTORE & ADMIN SDK ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+    firebase_admin.initialize_app(cred)
+db = firestore.Client.from_service_account_json(SERVICE_ACCOUNT_PATH)
+
+# --- FIREBASE AUTH REST ENDPOINTS ---
+FIREBASE_AUTH_SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
+FIREBASE_AUTH_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+FIREBASE_AUTH_RESET_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
+
+# --- HELPERS ---
+
+def is_valid_username(username):
+    # Must contain both letters and numbers, and be at least 6 chars
+    return (
+        len(username) >= 6 and
+        re.search(r"[A-Za-z]", username) and
+        re.search(r"\d", username)
+    )
+
+def username_exists(username):
+    users = db.collection("users").where("username", "==", username).get()
+    return len(users) > 0
+
+def email_exists(email):
+    users = db.collection("users").where("email", "==", email).get()
+    return len(users) > 0
+
+# --- FUNCTIONS ---
+
+def signup_user(email, password, role, username):
+    if not is_valid_username(username):
+        raise Exception("Username must contain both letters and numbers and be at least 6 characters.")
+    if username_exists(username):
+        raise Exception("Username already exists.")
+    if email_exists(email):
+        raise Exception("Email already exists.")
+    if len(password) < 6:
+        raise Exception("Password must be at least 6 characters long.")
+    # 1. Create user with Firebase Auth (REST API)
+    data = {
+        "email": email,
+        "password": password,
+        "returnSecureToken": True
+    }
+    r = requests.post(FIREBASE_AUTH_SIGNUP_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Signup failed"))
+    user = r.json()
+    uid = user["localId"]
+    # 2. Store role and username in Firestore
+    db.collection("users").document(uid).set({
+        "role": role,
+        "email": email,
+        "username": username
+    })
+    return user
+
+def login_user(identifier, password):
+    # identifier can be email or username
+    if "@" in identifier:
+        email = identifier
+    else:
+        # Lookup email by username
+        users = db.collection("users").where("username", "==", identifier).get()
+        if not users:
+            raise Exception("Username not found.")
+        email = users[0].to_dict()["email"]
+    # Now proceed as before
+    data = {
+        "email": email,
+        "password": password,
+        "returnSecureToken": True
+    }
+    r = requests.post(FIREBASE_AUTH_SIGNIN_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Login failed"))
+    user = r.json()
+    uid = user["localId"]
+    doc = db.collection("users").document(uid).get()
+    user_info = doc.to_dict()
+    role = user_info.get("role") if user_info else "user"
+    username = user_info.get("username") if user_info else ""
+    return {"idToken": user["idToken"], "email": email, "role": role, "username": username}
+
+def send_password_reset(email):
+    data = {
+        "requestType": "PASSWORD_RESET",
+        "email": email
+    }
+    r = requests.post(FIREBASE_AUTH_RESET_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Reset failed"))
+    return True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import streamlit as st
+from agents.auth_agent import signup_user, login_user, send_password_reset
+
+st.title("Insurance AuthAgent")
+
+# Initialize session state
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "page" not in st.session_state:
+    st.session_state["page"] = "Login"
+
+def signup_ui():
+    st.header("Sign Up")
+    username = st.text_input("Username (letters and numbers)", key="signup_username")
+    email = st.text_input("Email", key="signup_email")
+    password = st.text_input("Password", type="password", key="signup_pass")
+    if st.button("Register"):
+        try:
+            signup_user(email, password, 'user', username)
+            st.success("Registration successful! You can now log in.")
+        except Exception as e:
+            st.error(f"Sign up failed: {e}")
+
+def login_ui():
+    st.header("Login")
+    identifier = st.text_input("Email or Username", key="login_identifier")
+    password = st.text_input("Password", type="password", key="login_pass")
+    if st.button("Login"):
+        try:
+            user = login_user(identifier, password)
+            st.session_state["user"] = user
+            st.success(f"Logged in as {user['email']} (Role: {user['role']})")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Login failed: {e}")
+    if st.button("Forgot Password?"):
+        st.session_state["page"] = "Forgot Password"
+        st.rerun()
+
+def forgot_password_ui():
+    st.header("Forgot Password")
+    email = st.text_input("Email for password reset", key="reset_email")
+    if st.button("Send Password Reset Email"):
+        try:
+            send_password_reset(email)
+            st.success("Password reset email sent! Check your inbox.")
+        except Exception as e:
+            st.error(f"Reset failed: {e}")
+    if st.button("Back to Login"):
+        st.session_state["page"] = "Login"
+        st.rerun()
+
+def show_user_info():
+    user = st.session_state["user"]
+    st.header("User Info")
+    st.write(f"**Username:** {user.get('username', '')}")
+    st.write(f"**Email:** {user['email']}")
+    st.write(f"**Role:** {user['role']}")
+    st.write(f"**JWT Token:**")
+    st.code(user['idToken'], language="text")
+    if st.button("Logout"):
+        st.session_state["user"] = None
+        st.rerun()
+
+# Sidebar navigation (except on Forgot Password page)
+if st.session_state["page"] in ["Login", "Sign Up"]:
+    menu = st.sidebar.radio(
+        "Menu", ["Login", "Sign Up"],
+        index=["Login", "Sign Up"].index(st.session_state["page"])
+    )
+    if menu != st.session_state["page"]:
+        st.session_state["page"] = menu
+        st.rerun()
+
+# Main UI routing
+if st.session_state["user"]:
+    show_user_info()
+elif st.session_state["page"] == "Login":
+    login_ui()
+elif st.session_state["page"] == "Sign Up":
+    signup_ui()
+elif st.session_state["page"] == "Forgot Password":
+    forgot_password_ui()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import firebase_admin
+from firebase_admin import credentials, auth
+from google.cloud import firestore
+
+# --- CONFIGURATION ---
+SERVICE_ACCOUNT_PATH = "firestore-key.json"  # Path to your Firebase service account JSON
+
+# --- INITIALIZE FIREBASE ADMIN & FIRESTORE ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+    firebase_admin.initialize_app(cred)
+db = firestore.Client.from_service_account_json(SERVICE_ACCOUNT_PATH)
+
+# --- PARAMETERS: Set these for your admin user ---
+admin_email = "admin@insurance.com"
+admin_password = "AdminPass123"  # Must be at least 6 chars
+admin_username = "admin123"          # Display name
+
+# --- CREATE USER IN FIREBASE AUTH ---
+try:
+    user = auth.create_user(
+        email=admin_email,
+        password=admin_password,
+        display_name=admin_username,
+        email_verified=True,
+        disabled=False
+    )
+    print(f"Successfully created user: {user.uid}")
+except auth.EmailAlreadyExistsError:
+    user = auth.get_user_by_email(admin_email)
+    print(f"User already exists: {user.uid}")
+
+# --- SET CUSTOM CLAIM (role: admin) ---
+auth.set_custom_user_claims(user.uid, {"role": "admin"})
+print(f"Set custom claim 'role: admin' for {admin_email}")
+
+# --- STORE USER INFO IN FIRESTORE ---
+db.collection("users").document(user.uid).set({
+    "email": admin_email,
+    "username": admin_username,
+    "role": "admin"
+})
+print(f"Stored user info in Firestore for {admin_email}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import cv2
+import io
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from skimage.filters import threshold_sauvola
+from deskew import determine_skew
+import fitz  # PyMuPDF
+import concurrent.futures
+import torch
+from transformers import DetrImageProcessor, DetrForObjectDetection
+
+class PreprocessAgent:
+    def __init__(self):
+        self.layout_processor = DetrImageProcessor.from_pretrained("cmarkea/detr-layout-detection")
+        self.layout_model = DetrForObjectDetection.from_pretrained("cmarkea/detr-layout-detection")
+        try:
+            self.font = ImageFont.truetype("arial.ttf", 24)
+        except:
+            self.font = ImageFont.load_default()
+
+    def normalize_document(self, input_path):
+        ext = os.path.splitext(input_path)[1].lower()
+        handlers = {
+            '.pdf': self._handle_pdf,
+            '.txt': self._handle_txt,
+            '.docx': self._handle_docx,
+            '.jpg': self._handle_image,
+            '.jpeg': self._handle_image,
+            '.png': self._handle_image,
+            '.bmp': self._handle_image,
+            '.tiff': self._handle_image
+        }
+        if ext in handlers:
+            return handlers[ext](input_path)
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    def _handle_pdf(self, path):
+        doc = fitz.open(path)
+        return [{'image': Image.frombytes("RGB", [p.get_pixmap(dpi=300).width, p.get_pixmap(dpi=300).height], p.get_pixmap(dpi=300).samples), 'page': i+1} for i, p in enumerate(doc)]
+
+    def _handle_image(self, path):
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((2480, 2480), Image.LANCZOS)
+        return [{'image': img, 'page': 1}]
+
+    def _handle_txt(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        return self._text_to_images(text)
+
+    def _handle_docx(self, path):
+        from docx import Document
+        doc = Document(path)
+        text = '\n'.join([p.text for p in doc.paragraphs])
+        images = self._text_to_images(text)
+        images += self.extract_docx_images(doc)
+        return images
+
+    def _text_to_images(self, text, width=2480, height=3508, font_size=24, max_lines=120):
+        lines = text.split('\n')
+        pages = []
+        for i in range(0, len(lines), max_lines):
+            img = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(img)
+            margin, offset = 50, 50
+            for line in lines[i:i + max_lines]:
+                draw.text((margin, offset), line, font=self.font, fill="black")
+                offset += font_size + 10
+                if offset > height - margin:
+                    break
+            pages.append({'image': img, 'page': (i // max_lines) + 1})
+        return pages
+
+    def extract_docx_images(self, doc):
+        images = []
+        for rel in doc.part.rels.values():
+            if "image" in rel.target_ref:
+                img = Image.open(io.BytesIO(rel.target_part.blob)).convert('RGB')
+                images.append({'image': img, 'page': 'embedded'})
+        return images
+
+    def _to_gray(self, pil_img):
+        img = np.array(pil_img)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 else img
+
+    def enhance_contrast(self, pil_img, clip_limit=3.0, tile_grid_size=(8,8)):
+        img = self._to_gray(pil_img)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        return Image.fromarray(clahe.apply(img))
+
+    def denoise(self, pil_img, h=15):
+        img = self._to_gray(pil_img)
+        return Image.fromarray(cv2.fastNlMeansDenoising(img, None, h, 7, 21))
+
+    def sauvola_binarization(self, pil_img, window_size=35, k=0.2):
+        gray = self._to_gray(pil_img)
+        thresh = threshold_sauvola(gray, window_size=window_size, k=k)
+        return Image.fromarray(((gray > thresh).astype(np.uint8) * 255))
+
+    def otsu_binarization(self, pil_img):
+        img = self._to_gray(pil_img)
+        _, binary = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return Image.fromarray(binary)
+
+    def remove_lines(self, pil_img, horz_len=40, vert_len=40):
+        img = self._to_gray(pil_img)
+        _, binary = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        horz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horz_len, 1))
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_len))
+        lines = cv2.bitwise_or(
+            cv2.morphologyEx(binary, cv2.MORPH_OPEN, horz_kernel, iterations=1),
+            cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel, iterations=1)
+        )
+        cleaned = cv2.bitwise_and(binary, cv2.bitwise_not(lines))
+        return Image.fromarray(cleaned)
+
+    def correct_skew(self, pil_img):
+        img = self._to_gray(pil_img)
+        angle = determine_skew(img)
+        if abs(angle) > 0.1:
+            (h, w) = img.shape
+            M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+            rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return Image.fromarray(rotated)
+        return pil_img
+
+    def invert_image(self, pil_img):
+        return Image.fromarray(255 - np.array(pil_img))
+
+    def compute_quality_metrics(self, pil_img):
+        img = np.array(pil_img)
+        return {"mean": np.mean(img), "std": np.std(img), "contrast": img.max() - img.min()}
+
+    def auto_select_binarization(self, metrics):
+        return "otsu" if metrics["std"] < 50 and metrics["contrast"] > 100 else "sauvola"
+
+    def auto_invert(self, pil_img):
+        return np.mean(np.array(pil_img.convert('L'))) < 128
+
+    def extract_layout_regions(self, pil_img):
+        inputs = self.layout_processor(images=pil_img, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.layout_model(**inputs)
+        target_sizes = torch.tensor([pil_img.size[::-1]])
+        results = self.layout_processor.post_process_object_detection(
+            outputs, threshold=0.5, target_sizes=target_sizes
+        )[0]
+        regions = []
+        for box, label in zip(results["boxes"], results["labels"]):
+            if label in [5, 8, 9]:  # Table, text, title
+                xmin, ymin, xmax, ymax = map(int, box.tolist())
+                regions.append((xmin, ymin, xmax, ymax, int(label)))
+        return regions
+
+    def crop_and_merge_regions(self, pil_img, regions):
+        crops = [pil_img.crop((xmin, ymin, xmax, ymax)) for (xmin, ymin, xmax, ymax, _) in regions]
+        if not crops:
+            return pil_img
+        widths, heights = zip(*(c.size for c in crops))
+        merged = Image.new("RGB", (max(widths), sum(heights)), "white")
+        y_offset = 0
+        for c in crops:
+            merged.paste(c, (0, y_offset))
+            y_offset += c.size[1]
+        return merged
+
+    def process_single_page(self, img_dict):
+        try:
+            img = img_dict['image']
+            page = img_dict['page']
+            denoised = self.denoise(img)
+            enhanced = self.enhance_contrast(denoised)
+            metrics = self.compute_quality_metrics(enhanced)
+            bin_method = self.auto_select_binarization(metrics)
+            binarized = self.otsu_binarization(enhanced) if bin_method == "otsu" else self.sauvola_binarization(enhanced)
+            no_lines = self.remove_lines(binarized)
+            deskewed = self.correct_skew(no_lines)
+            invert = self.auto_invert(deskewed)
+            if invert:
+                deskewed = self.invert_image(deskewed)
+            regions = self.extract_layout_regions(deskewed.convert("RGB"))
+            focused = self.crop_and_merge_regions(deskewed.convert("RGB"), regions)
+            final_metrics = self.compute_quality_metrics(focused)
+            # No logging here
+            return {
+                "image": focused,
+                "page": page,
+                "metrics": final_metrics,
+                "binarization": bin_method,
+                "inverted": invert,
+                "regions": regions
+            }
+        except Exception as e:
+            # No logging here
+            return {"image": None, "page": img_dict.get('page', '?'), "metrics": {}, "error": str(e)}
+
+    def preprocess(self, input_path):
+        images = self.normalize_document(input_path)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
+            results = list(executor.map(self.process_single_page, images))
+        results.sort(key=lambda x: (str(x['page'])))
+        return results
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import streamlit as st
+from agents.preprocess_agent import PreprocessAgent
+from PIL import Image
+import tempfile
+import io
+import zipfile
+
+st.set_page_config(page_title="AI PreprocessAgent Demo", layout="wide")
+st.title("AI-Powered Universal Document PreprocessAgent Demo")
+st.markdown(
+    """
+    Upload a PDF, DOCX, TXT, or image file. The AI PreprocessAgent will automatically clean, enhance, deskew, segment (DETR), and prepare it for OCR/extraction, selecting the best methods for each document type.
+    """
+)
+
+uploaded_file = st.file_uploader(
+    "Upload a document (.pdf, .docx, .txt, .jpg, .jpeg, .png, .bmp, .tiff):",
+    type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "bmp", "tiff"]
+)
+
+if uploaded_file is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix="." + uploaded_file.name.split('.')[-1]) as temp_file:
+        temp_file.write(uploaded_file.read())
+        temp_path = temp_file.name
+
+    st.info("Processing, please wait. All decisions are made automatically by the agent.")
+    agent = PreprocessAgent()
+    results = agent.preprocess(temp_path)
+
+    for i, page in enumerate(results):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if page.get("image"):
+                st.image(page["image"], caption=f"Preprocessed Page {page['page']}", use_container_width=True)
+            else:
+                st.error(f"Error on page {page['page']}: {page.get('error')}")
+        with col2:
+            st.markdown(f"**Page:** {page['page']}")
+            if page.get("binarization"):
+                st.markdown(f"**Binarization:** {page['binarization'].capitalize()}")
+            if "inverted" in page:
+                st.markdown(f"**Inverted:** {'Yes' if page['inverted'] else 'No'}")
+            if page.get("metrics"):
+                st.markdown("**Quality Metrics:**")
+                for k, v in page["metrics"].items():
+                    st.write(f"{k}: {v:.2f}")
+            else:
+                st.write("No metrics available.")
+            if page.get("regions"):
+                st.markdown(f"**Detected Layout Regions:** {len(page['regions'])}")
+                for region in page["regions"]:
+                    st.write(f"Label {region[4]} @ ({region[0]}, {region[1]}, {region[2]}, {region[3]})")
+
+    st.success("Processing complete! Ready for OCR/Extraction.")
+
+    # Download all processed images as a zip
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        for page in results:
+            if page.get("image"):
+                img_bytes = io.BytesIO()
+                page["image"].save(img_bytes, format="PNG")
+                zf.writestr(f"preprocessed_page_{page['page']}.png", img_bytes.getvalue())
+    st.download_button(
+        label="Download All Processed Pages as ZIP",
+        data=zip_buffer.getvalue(),
+        file_name="preprocessed_pages.zip",
+        mime="application/zip"
+    )
+
