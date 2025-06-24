@@ -1,1 +1,278 @@
+import os
+import cv2
+import io
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from deskew import determine_skew
+import fitz  # PyMuPDF
+import concurrent.futures
+import torch
+from transformers import DetrImageProcessor, DetrForObjectDetection
+import pytesseract
+
+class PreprocessAgent:
+    def __init__(self):
+        self.layout_processor = DetrImageProcessor.from_pretrained("cmarkea/detr-layout-detection")
+        self.layout_model = DetrForObjectDetection.from_pretrained("cmarkea/detr-layout-detection")
+        try:
+            self.font_path = "arial.ttf"
+            self.font = ImageFont.truetype(self.font_path, 24)
+        except:
+            self.font_path = None
+            self.font = ImageFont.load_default()
+
+    def normalize_document(self, input_path):
+        ext = os.path.splitext(input_path)[1].lower()
+        handlers = {
+            '.pdf': self._handle_pdf,
+            '.txt': self._handle_txt,
+            '.docx': self._handle_docx,
+            '.jpg': self._handle_image,
+            '.jpeg': self._handle_image,
+            '.png': self._handle_image,
+            '.bmp': self._handle_image,
+            '.tiff': self._handle_image
+        }
+        if ext in handlers:
+            return handlers[ext](input_path)
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    def _handle_pdf(self, path):
+        doc = fitz.open(path)
+        return [{'image': Image.frombytes("RGB", [p.get_pixmap(dpi=300).width, p.get_pixmap(dpi=300).height], p.get_pixmap(dpi=300).samples), 'page': i+1} for i, p in enumerate(doc)]
+
+    def _handle_image(self, path):
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((2480, 2480), Image.LANCZOS)
+        return [{'image': img, 'page': 1}]
+
+    def _handle_txt(self, path):
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        return self._text_to_images(text)
+
+    def _handle_docx(self, path):
+        from docx import Document
+        doc = Document(path)
+        text = '\n'.join([p.text for p in doc.paragraphs])
+        images = self._text_to_images(text)
+        images += self.extract_docx_images(doc)
+        return images
+
+    def _text_to_images(self, text, width=2480, height=3508, font_size=24, max_lines=120):
+        lines = text.split('\n')
+        pages = []
+        for i in range(0, len(lines), max_lines):
+            img = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(img)
+            margin, offset = 50, 50
+            for line in lines[i:i + max_lines]:
+                draw.text((margin, offset), line, font=self.font, fill="black")
+                offset += font_size + 10
+                if offset > height - margin:
+                    break
+            pages.append({'image': img, 'page': (i // max_lines) + 1})
+        return pages
+
+    def extract_docx_images(self, doc):
+        images = []
+        for rel in doc.part.rels.values():
+            if "image" in rel.target_ref:
+                img = Image.open(io.BytesIO(rel.target_part.blob)).convert('RGB')
+                images.append({'image': img, 'page': 'embedded'})
+        return images
+
+    def _to_gray(self, pil_img):
+        img = np.array(pil_img)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 else img
+
+    def enhance_contrast(self, pil_img, clip_limit=3.0, tile_grid_size=(8,8)):
+        img = self._to_gray(pil_img)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+        return Image.fromarray(clahe.apply(img))
+
+    def denoise(self, pil_img, h=15):
+        img = self._to_gray(pil_img)
+        return Image.fromarray(cv2.fastNlMeansDenoising(img, None, h, 7, 21))
+
+    def remove_lines(self, pil_img, horz_len=40, vert_len=40):
+        img = self._to_gray(pil_img)
+        _, binary = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        horz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horz_len, 1))
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_len))
+        lines = cv2.bitwise_or(
+            cv2.morphologyEx(binary, cv2.MORPH_OPEN, horz_kernel, iterations=1),
+            cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel, iterations=1)
+        )
+        cleaned = cv2.bitwise_and(binary, cv2.bitwise_not(lines))
+        return Image.fromarray(cleaned)
+
+    def correct_skew(self, pil_img):
+        img = self._to_gray(pil_img)
+        angle = determine_skew(img)
+        if abs(angle) > 0.1:
+            (h, w) = img.shape
+            M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+            rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return Image.fromarray(rotated)
+        return pil_img
+
+    def invert_image(self, pil_img):
+        return Image.fromarray(255 - np.array(pil_img))
+
+    def compute_quality_metrics(self, pil_img):
+        img = np.array(pil_img)
+        return {"mean": np.mean(img), "std": np.std(img), "contrast": img.max() - img.min()}
+
+    def auto_invert(self, pil_img):
+        return np.mean(np.array(pil_img.convert('L'))) < 128
+
+    def extract_layout_regions(self, pil_img):
+        inputs = self.layout_processor(images=pil_img, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.layout_model(**inputs)
+        target_sizes = torch.tensor([pil_img.size[::-1]])
+        results = self.layout_processor.post_process_object_detection(
+            outputs, threshold=0.5, target_sizes=target_sizes
+        )[0]
+        regions = []
+        for box, label in zip(results["boxes"], results["labels"]):
+            if label in [5, 8, 9]:  # Table, text, title
+                xmin, ymin, xmax, ymax = map(int, box.tolist())
+                regions.append((xmin, ymin, xmax, ymax, int(label)))
+        return regions
+
+    def crop_and_merge_regions(self, pil_img, regions):
+        crops = [pil_img.crop((xmin, ymin, xmax, ymax)) for (xmin, ymin, xmax, ymax, _) in regions]
+        if not crops:
+            return pil_img
+        widths, heights = zip(*(c.size for c in crops))
+        merged = Image.new("RGB", (max(widths), sum(heights)), "white")
+        y_offset = 0
+        for c in crops:
+            merged.paste(c, (0, y_offset))
+            y_offset += c.size[1]
+        return merged
+
+    def binarize_by_sentence(self, pil_img):
+        # Downscale image for OCR/drawing if very large
+        max_dim = 1500
+        scale = min(max_dim / pil_img.width, max_dim / pil_img.height, 1.0)
+        img = pil_img
+        if scale < 1.0:
+            img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)), Image.LANCZOS)
+
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        output = Image.new("RGB", img.size, "white")
+        draw = ImageDraw.Draw(output)
+        font_path = self.font_path
+
+        lines = {}
+        n_boxes = len(data['text'])
+        for i in range(n_boxes):
+            if int(data['conf'][i]) > 0 and data['text'][i].strip() != "":
+                line_num = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+                if line_num not in lines:
+                    lines[line_num] = []
+                lines[line_num].append(i)
+
+        for line_indices in lines.values():
+            lefts = [data['left'][i] for i in line_indices]
+            tops = [data['top'][i] for i in line_indices]
+            rights = [data['left'][i] + data['width'][i] for i in line_indices]
+            bottoms = [data['top'][i] + data['height'][i] for i in line_indices]
+            left = min(lefts)
+            top = min(tops)
+            right = max(rights)
+            bottom = max(bottoms)
+            box_width = right - left
+            box_height = bottom - top
+            sentence = " ".join([data['text'][i] for i in line_indices])
+
+            # Maximize font size to fill the box
+            font_size = max(int(box_height * 0.9), 18)
+            if font_path:
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                except:
+                    font = self.font
+            else:
+                font = self.font
+
+            # Draw black rectangle
+            draw.rectangle([left, top, right, bottom], fill="black")
+            # Center text in box
+            bbox = draw.textbbox((0, 0), sentence, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            x = left + max(0, (box_width - text_width) // 2)
+            y = top + max(0, (box_height - text_height) // 2)
+            draw.text((x, y), sentence, fill="white", font=font)
+
+        # Upscale result to original image size
+        if scale < 1.0:
+            output = output.resize(pil_img.size, Image.LANCZOS)
+        return output
+
+    def process_single_page(
+        self, img_dict,
+        window_size=51, k=0.15,
+        force_binarization="sentence",
+        ocr_engine=None
+    ):
+        try:
+            img = img_dict['image']
+            page = img_dict['page']
+            denoised = self.denoise(img)
+            enhanced = self.enhance_contrast(denoised)
+            metrics = self.compute_quality_metrics(enhanced)
+            processed = self.binarize_by_sentence(enhanced)
+            bin_method = "sentence"
+            no_lines = self.remove_lines(processed)
+            deskewed = self.correct_skew(no_lines)
+            invert = self.auto_invert(deskewed)
+            if invert:
+                deskewed = self.invert_image(deskewed)
+            regions = self.extract_layout_regions(deskewed.convert("RGB"))
+            focused = self.crop_and_merge_regions(deskewed.convert("RGB"), regions)
+            final_metrics = self.compute_quality_metrics(focused)
+            ocr_results = {}
+            if ocr_engine is not None:
+                ocr_results["grayscale"] = ocr_engine(enhanced)
+                ocr_results["binarized"] = ocr_engine(processed)
+            return {
+                "image": focused,
+                "page": page,
+                "metrics": final_metrics,
+                "binarization": bin_method,
+                "inverted": invert,
+                "regions": regions,
+                "ocr_results": ocr_results if ocr_results else None
+            }
+        except Exception as e:
+            return {"image": None, "page": img_dict.get('page', '?'), "metrics": {}, "error": str(e)}
+
+    def preprocess(
+        self, input_path,
+        window_size=51, k=0.15,
+        force_binarization="sentence",
+        ocr_engine=None
+    ):
+        images = self.normalize_document(input_path)
+        # ThreadPoolExecutor works with instance methods and lambdas
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
+            results = list(
+                executor.map(
+                    lambda img_dict: self.process_single_page(
+                        img_dict,
+                        window_size=window_size,
+                        k=k,
+                        force_binarization=force_binarization,
+                        ocr_engine=ocr_engine
+                    ),
+                    images
+                )
+            )
+        results.sort(key=lambda x: (str(x['page'])))
+        return results
 
