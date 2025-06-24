@@ -1,7 +1,1 @@
-[firebase]
-apiKey = "AIzaSyBLHn106tlG9gcmM0zfcYWZJ03dnWKb4yg"
-authDomain = "ai-auth-agent.firebaseapp.com"
-databaseURL = "https://ai-auth-agent-default-rtdb.firebaseio.com/"
-storageBucket = "ai-auth-agent.firebasestorage.app"
-
 
