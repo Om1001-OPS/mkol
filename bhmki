@@ -1,20 +1,14 @@
-$DIR = "$env:USERPROFILE\Downloads\insurance_doc_automation"
-$VENV = "$DIR\venv\Scripts\activate"
+@echo off
+set DIR=%USERPROFILE%\Downloads\insurance_doc_automation
+set VENV=%DIR%\venv\Scripts\activate
 
-# List of agents and ports
-$AGENTS = @(
-    "uvicorn agents.auth_agent:app --reload --port 8001",
-    "uvicorn agents.navigator_agent:app --reload --port 8009",
-    "uvicorn agents.intake_agent:app --reload --port 8004",
-    "uvicorn agents.preprocess_agent:app --reload --port 8005",
-    "uvicorn agents.extraction_agent:app --reload --port 8007",
-    "uvicorn agents.validation_agent:app --reload --port 8002",
-    "uvicorn agents.sync_agent:app --reload --port 8003",
-    "uvicorn agents.feedback_agent:app --reload --port 8006",
-    "uvicorn agents.notify_agent:app --reload --port 8008"
-)
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.auth_agent:app --reload --port 8001"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.navigator_agent:app --reload --port 8009"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.intake_agent:app --reload --port 8004"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.preprocess_agent:app --reload --port 8005"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.extraction_agent:app --reload --port 8007"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.validation_agent:app --reload --port 8002"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.sync_agent:app --reload --port 8003"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.feedback_agent:app --reload --port 8006"
+start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.notify_agent:app --reload --port 8008"
 
-foreach ($CMD in $AGENTS) {
-    wt -w 0 nt --title "Agent" powershell -NoExit -Command "cd $DIR; & $VENV; $CMD"
-    Start-Sleep -Seconds 1
-}
