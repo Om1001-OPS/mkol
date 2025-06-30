@@ -1,30 +1,38 @@
-[
-  {
-    "policy_id": "ABC123456",
-    "username": "john.doe@email.com",
-    "sanction_limit": 130.00,
-    "customer_name": "John Doe",
-    "date_of_birth": "January 15, 1980",
-    "address": "123 Main Street, Cityville, State, Zip",
-    "phone_number": "(555) 555-5555",
-    "group_number": "G98765",
-    "provider_name": "XYZ Medical Clinic",
-    "provider_npi": "1234567890",
-    "provider_address": "456 Oak Avenue, Cityville, State, Zip",
-    "provider_phone": "(555) 123-4567",
-    "provider_fax": "(555) 123-4568",
-    "provider_email": "xyzclinic@email.com",
-    "date_of_service": "March 1, 2023",
-    "service_description": "Office Consultation",
-    "diagnosis_code": "M10.9"
-  }
-]
-
-
-
-
-
-
-
-
-
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+streamlit>=1.20.0
+requests>=2.28.0
+pydantic>=1.10.0
+firebase-admin>=6.0.0
+transformers>=4.30.0
+torch>=2.0.0
+chromadb>=0.3.21
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+pillow>=9.0.0
+opencv-python-headless>=4.7.0.72
+pytesseract>=0.3.10
+docx>=0.8.11
+langchain>=0.0.200
+deskew>=0.6.0
+numpy>=1.24.0
+pandas>=1.5.0
+python-dateutil>=2.8.2
+google-cloud-firestore>=2.11.0
+# For HuggingFaceHub login and embeddings
+huggingface-hub>=0.16.4
+# For environment variable loading (dotenv)
+python-dotenv>=1.0.0
+# For concurrency in preprocess agent
+concurrent-log-handler>=0.9.24
+# For PDF processing in preprocess agent
+pymupdf>=1.23.0
+# For additional document formats
+python-docx>=0.8.11
+# For security and JWT decoding (if needed)
+pyjwt>=2.7.0
+# For image font handling
+fonttools>=4.39.0
+# Optional: for admin dashboards, analytics, etc.
+matplotlib>=3.7.0
+scikit-learn>=1.2.0
