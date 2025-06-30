@@ -1,14 +1,13 @@
-@echo off
-set DIR=%USERPROFILE%\Downloads\insurance_doc_automation
-set VENV=%DIR%\venv\Scripts\activate
-
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.auth_agent:app --reload --port 8001"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.navigator_agent:app --reload --port 8009"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.intake_agent:app --reload --port 8004"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.preprocess_agent:app --reload --port 8005"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.extraction_agent:app --reload --port 8007"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.validation_agent:app --reload --port 8002"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.sync_agent:app --reload --port 8003"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.feedback_agent:app --reload --port 8006"
-start cmd /k "cd /d %DIR% && call %VENV% && uvicorn agents.notify_agent:app --reload --port 8008"
-
+{
+  "type": "service_account",
+  "project_id": "ai-auth-agent",
+  "private_key_id": "3aafa10de65334745f3ed7e9325478f0ecb52e16",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCjPTkzZvM5ZEIQ\neNcYnT0GGE+NYz6UNpJ6e2Pe03k0Y4wa6h4QIK5qs7K235GmbVNPK88+7Jn1nwHO\nhfRic3oftPp/e7eK5lkNZqwnjaNY3Xgf76pwomjyKfvIH7bDQzchrjOtLsjM2OPz\ni5gBMvd+ZTMMl8zLwbk49uu8vPkuYb6HtgOHUnM748DWeWBLWl3HJjZzVt4ohEdM\n8gdVcRykwE5cIMS5rUnq8Mq6Q9DvHFslYma24XIBBzoEYr3ePRQJyGhLfYmKVnjj\nGaoGnmyHylQY1w/IG+Vb+qsgY5Jh9ySsFlxbZMDx3eA1kMzyCGzKIQPfBXdqCaCj\n1UbSK2g3AgMBAAECggEAJR9vOrlW5t5eB9DzWa2oixJMRSMkwCAI/8G/3JTLI5bf\n7d8AJzrHb4yeP+hn/yktoPudjfnQqYMXrhfYk+sfAsbtkMBZ5UStS9bln7keRL9Y\n6ipe4G6O30Oc9s3/ijhm+Unchq31DGDmtiQw1VT548yv51U+RbgwnzvIMIvpPxqt\n/OSFJK3cuj9ZQXwH/qI4TJQX4SiWQ4asplQyqmh5o24x9oujvw3dMjlgTf9b91s6\n229F/sLfY2LDcC3hkayQKojz7GpFT5j3sF8hoGhOXq5q8fezagHGtTQyjrYbti3p\nzlPGCY4EhpNCNnjKsuz7ppMI7Vpn+DAXeAWCbVBugQKBgQDiN1zwct/uCF6KF1uI\nINfhKs5dYQ0KpabEwvpkRymg+4qIgMR5KGxIgZJtPqymqUpHd6ew8pYEaRkv36jL\nPD16WArpvKU+GFzvSHupkrnAEonZL2RBn1ji734HXqVOlMcjtT8MA7rOo3G5+qIX\nVH7IfIW1ePLAzHJLv4oMmFl43wKBgQC4uzZGLUR2fwcCPZU7Drbb/u4Z1w4y8UKk\niAdsHVc3TLvuuXXztuCbLMtKQXh9BG0KW4UYMCYVZ4YJ0W56Z34gPKUy44WuE1Ox\nSxNRZZGyhYWSIMfFeQ8ftdC9ilq8g4GgkKXFMG560NS0+Ow3ROlxZjnjn1ElDQgn\nRM89M1ADqQKBgGQ95jhCn0pKeSI2IYBcFW2Y22NzqyTJrPHJ+MzQ3/iPHp9IeEe8\nCufCSxGP0U/0+o5azntRs/p2XAvjz1dn9VIui39x8cNnZl8+PlYxR5B+ZolQP9v4\ncZn2SGGZpiUBNpFzMmHvkSsaMD4aexNdhOTwkQuOcfvPXOKGGPVl2Vf/AoGBAIlQ\nh9B0V56pX8FXm3TxxBUVk1Fb3S8azQnWH4ZK7QirHkseSsIlXyGZk2cX8YMkZhU7\n4FwRdk2UzTrBFZkhEszNp5KDM1wo+54fCzYHBN0piRcNDNIJ4acVlBtAG6BjNFjx\nDHfeP1FFp8b5/UQ8EjZ74W4Ef+HFpRjjehSo7sI5AoGBAJ8chFzMTQ8a98zQxkb3\nYO3IpKZFFkJlz+NgKtruv4vZyiePO5+dJF5hE/zTBwkv3C0N3JdwFj7mr+awr/Vq\n+2chUi4WS5SqVrTHFJhwHT0y4OMShgQRvHKe2dtWKGl7pw8EJrc/YeAXlkrKJviQ\nuBoPzsFLhrz31tZIPGHPxrJK\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-fbsvc@ai-auth-agent.iam.gserviceaccount.com",
+  "client_id": "104769609169500114009",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40ai-auth-agent.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
