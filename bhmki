@@ -1,761 +1,341 @@
 import os
-import requests
-from google.cloud import firestore
-import firebase_admin
-from firebase_admin import credentials
-from fastapi import FastAPI, HTTPException
-import re
-from firebase_admin import credentials, auth
-
-# --- CONFIGURATION ---
-FIREBASE_API_KEY = "AIzaSyBLHn106tlG9gcmM0zfcYWZJ03dnWKb4yg"  # <-- Replace with your project's API key
-SERVICE_ACCOUNT_PATH = "firestore-key.json"  # Ensure this is in your project folder
-
-# --- INITIALIZE FIRESTORE & ADMIN SDK ---
-if not firebase_admin._apps:
-    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-    firebase_admin.initialize_app(cred)
-db = firestore.Client.from_service_account_json(SERVICE_ACCOUNT_PATH)
-
-# --- FIREBASE AUTH REST ENDPOINTS ---
-FIREBASE_AUTH_SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
-FIREBASE_AUTH_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
-FIREBASE_AUTH_RESET_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
-
-# --- HELPERS ---
-
-def is_valid_username(username):
-    # Must contain both letters and numbers, and be at least 6 chars
-    return (
-        len(username) >= 6 and
-        re.search(r"[A-Za-z]", username) and
-        re.search(r"\d", username)
-    )
-
-def username_exists(username):
-    users = db.collection("users").where("username", "==", username).get()
-    return len(users) > 0
-
-def email_exists(email):
-    users = db.collection("users").where("email", "==", email).get()
-    return len(users) > 0
-
-# --- FUNCTIONS ---
-
-def signup_user(email, password, role, username):
-    if not is_valid_username(username):
-        raise Exception("Username must contain both letters and numbers and be at least 6 characters.")
-    if username_exists(username):
-        raise Exception("Username already exists.")
-    if email_exists(email):
-        raise Exception("Email already exists.")
-    if len(password) < 6:
-        raise Exception("Password must be at least 6 characters long.")
-    # 1. Create user with Firebase Auth (REST API)
-    data = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    r = requests.post(FIREBASE_AUTH_SIGNUP_URL, json=data)
-    if r.status_code != 200:
-        raise Exception(r.json().get("error", {}).get("message", "Signup failed"))
-    user = r.json()
-    uid = user["localId"]
-    # 2. Store role and username in Firestore
-    db.collection("users").document(uid).set({
-        "role": role,
-        "email": email,
-        "username": username
-    })
-    return user
-
-def login_user(identifier, password):
-    # identifier can be email or username
-    if "@" in identifier:
-        email = identifier
-    else:
-        # Lookup email by username
-        users = db.collection("users").where("username", "==", identifier).get()
-        if not users:
-            raise Exception("Username not found.")
-        email = users[0].to_dict()["email"]
-    # Now proceed as before
-    data = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    r = requests.post(FIREBASE_AUTH_SIGNIN_URL, json=data)
-    if r.status_code != 200:
-        raise Exception(r.json().get("error", {}).get("message", "Login failed"))
-    user = r.json()
-    uid = user["localId"]
-    doc = db.collection("users").document(uid).get()
-    user_info = doc.to_dict()
-    role = user_info.get("role") if user_info else "user"
-    username = user_info.get("username") if user_info else ""
-    return {"idToken": user["idToken"], "email": email, "role": role, "username": username}
-
-def send_password_reset(email):
-    data = {
-        "requestType": "PASSWORD_RESET",
-        "email": email
-    }
-    r = requests.post(FIREBASE_AUTH_RESET_URL, json=data)
-    if r.status_code != 200:
-        raise Exception(r.json().get("error", {}).get("message", "Reset failed"))
-    return True
-
-app = FastAPI(title="AuthAgent")
-
-@app.post("/login")
-async def login(data: dict):
-    try:
-        result = login_user(data["identifier"], data["password"])
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/signup")
-async def signup(data: dict):
-    try:
-        result = signup_user(data["email"], data["password"], data["role"], data["username"])
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("auth_agent:app", host="127.0.0.1", port=8001, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import os
 import logging
-from fastapi import FastAPI
-from dotenv import load_dotenv
-from langchain.llms import HuggingFacePipeline
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from transformers import pipeline
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from typing import TypedDict, Optional, Dict, Any, List
+import requests
+from langgraph.graph import StateGraph
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-
-load_dotenv()
-
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-# --- LLM Setup (Optional, for fallback only) ---
-pipe = pipeline("text2text-generation", model="google/flan-t5-base", max_length=32)
-llm = HuggingFacePipeline(pipeline=pipe)
+# --- Configuration ---
+AGENT_ENDPOINTS = {
+    "auth": os.getenv("AUTH_AGENT_URL", "http://localhost:8001"),
+    "navigator": os.getenv("NAVIGATOR_AGENT_URL", "http://localhost:8009"),
+    "intake": os.getenv("INTAKE_AGENT_URL", "http://localhost:8004"),
+    "preprocess": os.getenv("PREPROCESS_AGENT_URL", "http://localhost:8005"),
+    "extract": os.getenv("EXTRACTION_AGENT_URL", "http://localhost:8007"),
+    "validate": os.getenv("VALIDATION_AGENT_URL", "http://localhost:8002"),
+    "sync": os.getenv("SYNC_AGENT_URL", "http://localhost:8003"),
+    "feedback": os.getenv("FEEDBACK_AGENT_URL", "http://localhost:8006"),
+    "notify": os.getenv("NOTIFY_AGENT_URL", "http://localhost:8008"),
+}
 
-prompt = PromptTemplate(
-    template=(
-        "Instruction: Given the metadata, reply ONLY with one of: Intake Agent, Sync Agent, SelectDocument Type.\n"
-        "###\n"
-        "Metadata:\n"
-        "Document Type: {doc_type}\n"
-        "User Role: {user_role}\n"
-        "Action: {action}\n"
-        "###\n"
-        "Response:"
-    ),
-    input_variables=["doc_type", "user_role", "action"]
-)
-chain = LLMChain(llm=llm, prompt=prompt)
+# --- Shared State Definition ---
+class WorkflowState(TypedDict, total=False):
+    user_credentials: Dict[str, Any]
+    user: Dict[str, Any]
+    id_token: Optional[str]  # Store the Bearer token here
+    document: Optional[Dict[str, Any]]
+    preprocessed_data: Optional[Any]
+    extracted_data: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    sync_status: Optional[Dict[str, Any]]
+    feedback_data: Optional[Dict[str, Any]]
+    notification: Optional[Dict[str, Any]]
+    uploaded_files: Optional[List[Any]]
+    next_agent: Optional[str]
+    user_role: Optional[str]
+    doc_type: Optional[str]
+    action: Optional[str]
+    username: Optional[str]
 
-# --- Deterministic Routing Function ---
-def route_document(metadata: dict) -> str:
-    doc_type = metadata.get("doc_type", "").strip()
-    user_role = metadata.get("user_role", "").strip().lower()
-    action = metadata.get("action", "").strip().lower()
+def close_uploaded_files(files):
+    for _, file_tuple in files:
+        file_obj = file_tuple[1]
+        if hasattr(file_obj, "close"):
+            file_obj.close()
 
-    logging.info(f"Routing metadata: doc_type='{doc_type}', user_role='{user_role}', action='{action}'")
-
-    # Deterministic rules (robust, fast)
-    if not doc_type:
-        logging.info("doc_type is empty. Returning SelectDocument Type.")
-        return "SelectDocument Type"
-    if user_role == "admin" and action == "review":
-        return "Sync Agent"
-    if user_role == "admin" and action == "upload":
-        return "Intake Agent"
-    if user_role == "user":
-        return "Intake Agent"
-
-    # --- LLM Fallback (should rarely be needed) ---
+def agent_post(endpoint: str, path: str, state: Optional[WorkflowState] = None, **kwargs):
+    url = f"{endpoint}{path}"
+    headers = kwargs.pop("headers", {})
+    if state and "id_token" in state and state["id_token"]:
+        headers["Authorization"] = state["id_token"]
     try:
-        llm_input = {
-            "doc_type": doc_type,
-            "user_role": user_role,
-            "action": action
-        }
-        llm_output = chain.run(llm_input).strip().split("\n")[0].strip()
-        logging.info(f"LLM output: '{llm_output}'")
-        valid_agents = {
-            "intake agent": "Intake Agent",
-            "sync agent": "Sync Agent",
-            "selectdocument type": "SelectDocument Type",
-            "select document type": "SelectDocument Type"
-        }
-        response_key = llm_output.lower().replace(" ", "")
-        for key, val in valid_agents.items():
-            if key.replace(" ", "") == response_key:
-                return val
+        logging.info(f"POST {url} | Payload: {kwargs.get('json') or kwargs.get('data') or kwargs.get('files')}")
+        resp = requests.post(url, headers=headers, **kwargs)
+        logging.info(f"Response [{resp.status_code}]: {resp.text}")
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        logging.error(f"LLM fallback failed: {e}")
+        logging.error(f"Error calling {url}: {e}")
+        raise
 
-    # Final fallback
-    return "SelectDocument Type"
-
-# --- FastAPI App ---
-app = FastAPI(title="NavigatorAgent")
-
-@app.post("/route")
-async def route(metadata: dict, user=Depends(verify_token)):
+def agent_get(endpoint: str, path: str, state: Optional[WorkflowState] = None, **kwargs):
+    url = f"{endpoint}{path}"
+    headers = kwargs.pop("headers", {})
+    if state and "id_token" in state and state["id_token"]:
+        headers["Authorization"] = state["id_token"]
     try:
-        result = route_document(metadata)
-        logging.info(f"route_document returned: {result}")
-        return {"next_agent": result}
+        resp = requests.get(url, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        logging.error(f"Error in route: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logging.error(f"Error calling {url}: {e}")
+        raise
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("navigator_agent:app", host="127.0.0.1", port=8009, reload=True)
+# --- Agent Node Wrappers ---
+def auth_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling AuthAgent")
+    payload = state['user_credentials']
+    user_info = agent_post(AGENT_ENDPOINTS["auth"], "/login", json=payload)
+    state['user'] = user_info
+    state['user_role'] = user_info.get("role")
+    state['username'] = user_info.get("username")
+    # Store token with Bearer prefix for forwarding
+    state['id_token'] = f"Bearer {user_info.get('idToken')}"
+    return state
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from typing import List, Dict
-import shutil
-import os
-import uuid
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-app = FastAPI(title="IntakeAgent", description="Handles document intake and local storage")
-
-BASE_DIR = "uploaded_document"
-DOC_TYPES = {"policy", "report", "claim", "ID Proof", "Payment Receipt"}
-user_file_map: Dict[str, List[Dict]] = {}
-
-for doc_type in DOC_TYPES:
-    os.makedirs(os.path.join(BASE_DIR, doc_type), exist_ok=True)
-
-@app.post("/upload_document")
-async def upload_document(
-    files: List[UploadFile] = File(...),
-    document_type: str = Form(...),
-    username: str = Form(...),
-    user=Depends(verify_token)
-):
-    if document_type not in DOC_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid document type")
-
-    if username not in user_file_map:
-        user_file_map[username] = []
-
-    preview_objects = []
-
-    for file in files:
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in [".pdf", ".jpg", ".jpeg", ".png", ".txt", ".docx"]:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
-
-        filename = f'{uuid.uuid4().hex}_{file.filename}'
-        dir_path = os.path.join(BASE_DIR, document_type)
-        os.makedirs(dir_path, exist_ok=True)
-        local_path = os.path.join(dir_path, filename)
-        with open(local_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        index = len(user_file_map[username]) + 1
-        user_file_map[username].append({
-            "index": index,
-            "filename": file.filename,
-            "local_path": local_path,
-            "document_type": document_type
-        })
-
-        preview_objects.append({
-            "index": index,
-            "filename": file.filename,
-            "file_path": local_path  # This is what you pass to PreprocessAgent
-        })
-
-    return {
-        "message": f"{len(files)} files uploaded by {username} and saved locally.",
-        "previews": preview_objects
+def navigator_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling NavigatorAgent")
+    if not state.get("doc_type"):
+        raise Exception("doc_type missing in state")
+    if not state.get("user_role"):
+        raise Exception("user_role missing in state")
+    if not state.get("action"):
+        # Default action for user role
+        state["action"] = "upload" if state["user_role"].lower() == "user" else "review"
+    payload = {
+        "doc_type": state["doc_type"],
+        "user_role": state["user_role"].lower(),
+        "action": state["action"].lower()
     }
+    result = agent_post(AGENT_ENDPOINTS["navigator"], "/route", state=state, json=payload)
+    state['next_agent'] = result.get('next_agent', 'Intake Agent')
+    return state
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to IntakeAgent. Upload your documents here."}
+def intake_agent_node(state: WorkflowState) -> WorkflowState:
+    if "document" in state and state["document"]:
+        # Already uploaded, skip to next step
+        return state
+    logging.info("Calling IntakeAgent")
+    if not state.get("uploaded_file_path"):
+        raise Exception("uploaded_file_path missing in state")
+    file_path = state["uploaded_file_path"]
+    files = [("files", (os.path.basename(file_path), open(file_path, "rb")))]
+    data = {
+        "document_type": state["doc_type"],
+        "username": state["username"]
+    }
+    try:
+        result = agent_post(AGENT_ENDPOINTS["intake"], "/upload_document", state=state, files=files, data=data)
+        user_map = agent_get(AGENT_ENDPOINTS["intake"], "/user_map", state=state)
+        local_path = None
+        for user_files in user_map.get(state["username"], []):
+            if user_files["filename"] == os.path.basename(file_path):
+                local_path = user_files["local_path"]
+                break
+        if not local_path:
+            raise Exception("Uploaded file not found in user map")
+        state['document'] = {
+            "file_path": local_path,
+            "doc_type": state["doc_type"],
+            "metadata": {"username": state["username"], "document_type": state["doc_type"]}
+        }
+        return state
+    finally:
+        close_uploaded_files(files)
 
-@app.get("/user_map", summary="Full user-file map")
-def get_map():
-    return user_file_map
+def preprocess_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info(f"Calling PreprocessAgent for file: {state['document']['file_path']}")
+    payload = {"file_path": state["document"]["file_path"]}
+    result = agent_post(AGENT_ENDPOINTS["preprocess"], "/preprocess", state=state, json=payload)
+    logging.info("Preprocessing complete.")
+    return state
+
+def extraction_agent_node(state: WorkflowState) -> WorkflowState:
+    original_file_path = state['document']["file_path"]
+    logging.info(f"Calling ExtractionAgent for original file: {original_file_path}")
+    payload = {"file_paths": [original_file_path], "doc_type": state["doc_type"]}
+    result = agent_post(AGENT_ENDPOINTS["extract"], "/extract", state=state, json=payload)
+    state['extracted_data'] = result
+    return state
+
+def validation_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling ValidationAgent")
+    payload = state["extracted_data"]
+    result = agent_post(AGENT_ENDPOINTS["validate"], "/validate", state=state, json=payload)
+    state['validation_result'] = result
+    return state
+
+def sync_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling SyncAgent")
+    validated_record = {
+        "record_id": 1,  # Use unique IDs in production
+        "validated_json": state.get("validation_result", {})
+    }
+    batch = {"records": [validated_record]}
+    result = agent_post(AGENT_ENDPOINTS["sync"], "/sync_batch", state=state, json=batch)
+    state['sync_status'] = result
+    return state
+
+def feedback_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling FeedbackAgent")
+    issue_text = str(state.get("validation_result", {}).get("errors", ""))
+    if not issue_text or issue_text == "[]":
+        issue_text = state.get("validation_result", {}).get("reason", "Unknown error")
+    if not issue_text:
+        issue_text = "Validation failed, but no error details were provided."
+    payload = {
+        "username": state["username"],
+        "issue_text": issue_text,
+        "rating": 1
+    }
+    result = agent_post(AGENT_ENDPOINTS["feedback"], "/submit-feedback", state=state, json=payload)
+    state['feedback_data'] = result
+    return state
+
+def notify_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling NotifyAgent")
+    status_value = state["validation_result"].get("valid")
+    if status_value is True:
+        status_str = "validated"
+    elif status_value is False:
+        status_str = "rejected"
+    else:
+        status_str = str(status_value)
+    extracted_text = state["extracted_data"].get("ocr_text", "")
+    if not extracted_text:
+        extracted_text = state["validation_result"].get("reason", "")
+    payload = {
+        "document_type": state["doc_type"],
+        "status": status_str,
+        "extracted_text": extracted_text
+    }
+    result = agent_post(AGENT_ENDPOINTS["notify"], "/notify", state=state, json=payload)
+    state['notification'] = result
+    return state
+
+def sync_agent_review_node(state: WorkflowState) -> WorkflowState:
+    if state.get('user_role') != 'admin':
+        raise Exception("Admin access required for review.")
+    logging.info("Calling SyncAgent for Admin Review")
+    result = agent_get(AGENT_ENDPOINTS["sync"], "/view_data", state=state)
+    state['sync_status'] = result
+    return state
+
+# --- LangGraph Orchestration ---
+graph = StateGraph(WorkflowState)
+graph.add_node("auth", auth_agent_node)
+graph.add_node("navigator", navigator_agent_node)
+graph.add_node("intake", intake_agent_node)
+graph.add_node("preprocess", preprocess_agent_node)
+graph.add_node("extract", extraction_agent_node)
+graph.add_node("validate", validation_agent_node)
+graph.add_node("sync", sync_agent_node)
+graph.add_node("sync_review", sync_agent_review_node)
+graph.add_node("feedback", feedback_agent_node)
+graph.add_node("notify", notify_agent_node)
+
+graph.set_entry_point("auth")
+graph.add_edge("auth", "navigator")
+
+def nav_condition(state: WorkflowState):
+    agent = state.get("next_agent", "Intake Agent")
+    logging.info(f"NavigatorAgent next_agent: {agent}")
+    if agent == "Intake Agent":
+        return "intake"
+    elif agent == "Sync Agent":
+        return "sync_review"
+    elif agent == "SelectDocument Type":
+        logging.error("NavigatorAgent: Document type not selected. Stopping workflow.")
+        exit(1)
+    else:
+        logging.error(f"NavigatorAgent returned unknown next_agent: {agent}. Stopping workflow.")
+        exit(1)
+graph.add_conditional_edges("navigator", nav_condition)
+
+graph.add_edge("intake", "preprocess")
+graph.add_edge("preprocess", "extract")
+graph.add_edge("extract", "validate")
+
+def validation_condition(state: WorkflowState):
+    if state.get("validation_result", {}).get("valid"):
+        return "sync"
+    else:
+        return "feedback"
+graph.add_conditional_edges("validate", validation_condition)
+
+graph.add_edge("sync", "notify")
+graph.add_edge("feedback", "notify")
+# No further edge from sync_review (admin review is terminal)
+
+workflow = graph.compile()
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("intakeagent:app", host="127.0.0.1", port=8004, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import os
-import io
-import cv2
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from deskew import determine_skew
-import fitz  # PyMuPDF
-import concurrent.futures
-import torch
-from fastapi import FastAPI
-from transformers import DetrImageProcessor, DetrForObjectDetection
-import pytesseract
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-    
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-def convert_tuples_to_lists(obj):
-    if isinstance(obj, tuple):
-        return [convert_tuples_to_lists(i) for i in obj]
-    elif isinstance(obj, list):
-        return [convert_tuples_to_lists(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {k: convert_tuples_to_lists(v) for k, v in obj.items()}
-    else:
-        return obj
-
-class PreprocessAgent:
-    def __init__(self):
-        self.layout_processor = DetrImageProcessor.from_pretrained("cmarkea/detr-layout-detection")
-        self.layout_model = DetrForObjectDetection.from_pretrained("cmarkea/detr-layout-detection")
-        try:
-            self.font_path = "arial.ttf"
-            self.font = ImageFont.truetype(self.font_path, 24)
-        except:
-            self.font_path = None
-            self.font = ImageFont.load_default()
-
-    def normalize_document(self, input_path):
-        ext = os.path.splitext(input_path)[1].lower()
-        handlers = {
-            '.pdf': self._handle_pdf,
-            '.txt': self._handle_txt,
-            '.docx': self._handle_docx,
-            '.jpg': self._handle_image,
-            '.jpeg': self._handle_image,
-            '.png': self._handle_image,
-            '.bmp': self._handle_image,
-            '.tiff': self._handle_image,
+    logging.info("=== Starting Orchestrator ===")
+    initial_state = WorkflowState(
+        user_credentials={
+            "identifier": input("Enter username/email: "),
+            "password": input("Enter password: ")
         }
-        if ext in handlers:
-            return handlers[ext](input_path)
-        raise ValueError(f"Unsupported file type: {ext}")
-
-    def _handle_pdf(self, path):
-        doc = fitz.open(path)
-        return [{'image': Image.frombytes("RGB", [p.get_pixmap(dpi=300).width, p.get_pixmap(dpi=300).height], p.get_pixmap(dpi=300).samples), 'page': i+1} for i, p in enumerate(doc)]
-
-    def _handle_image(self, path):
-        img = Image.open(path).convert('RGB')
-        img.thumbnail((2480, 2480), Image.LANCZOS)
-        return [{'image': img, 'page': 1}]
-
-    def _handle_txt(self, path):
-        with open(path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        return self._text_to_images(text)
-
-    def _handle_docx(self, path):
-        from docx import Document
-        doc = Document(path)
-        text = '\n'.join([p.text for p in doc.paragraphs])
-        images = self._text_to_images(text)
-        images += self.extract_docx_images(doc)
-        return images
-
-    def _text_to_images(self, text, width=2480, height=3508, font_size=24, max_lines=120):
-        lines = text.split('\n')
-        pages = []
-        for i in range(0, len(lines), max_lines):
-            img = Image.new("RGB", (width, height), "white")
-            draw = ImageDraw.Draw(img)
-            margin, offset = 50, 50
-            for line in lines[i:i + max_lines]:
-                draw.text((margin, offset), line, font=self.font, fill="black")
-                offset += font_size + 10
-                if offset > height - margin:
-                    break
-            pages.append({'image': img, 'page': (i // max_lines) + 1})
-        return pages
-
-    def extract_docx_images(self, doc):
-        images = []
-        for rel in doc.part.rels.values():
-            if "image" in rel.target_ref:
-                img = Image.open(io.BytesIO(rel.target_part.blob)).convert('RGB')
-                images.append({'image': img, 'page': 'embedded'})
-        return images
-
-    def _to_gray(self, pil_img):
-        img = np.array(pil_img)
-        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if len(img.shape) == 3 else img
-
-    def enhance_contrast(self, pil_img, clip_limit=3.0, tile_grid_size=(8,8)):
-        img = self._to_gray(pil_img)
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-        return Image.fromarray(clahe.apply(img))
-
-    def denoise(self, pil_img, h=15):
-        img = self._to_gray(pil_img)
-        return Image.fromarray(cv2.fastNlMeansDenoising(img, None, h, 7, 21))
-
-    def remove_lines(self, pil_img, horz_len=40, vert_len=40):
-        img = self._to_gray(pil_img)
-        _, binary = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        horz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horz_len, 1))
-        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_len))
-        lines = cv2.bitwise_or(
-            cv2.morphologyEx(binary, cv2.MORPH_OPEN, horz_kernel, iterations=1),
-            cv2.morphologyEx(binary, cv2.MORPH_OPEN, vert_kernel, iterations=1)
-        )
-        cleaned = cv2.bitwise_and(binary, cv2.bitwise_not(lines))
-        return Image.fromarray(cleaned)
-
-    def correct_skew(self, pil_img):
-        img = self._to_gray(pil_img)
-        angle = determine_skew(img)
-        if abs(angle) > 0.1:
-            (h, w) = img.shape
-            M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-            rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-            return Image.fromarray(rotated)
-        return pil_img
-
-    def invert_image(self, pil_img):
-        return Image.fromarray(255 - np.array(pil_img))
-
-    def compute_quality_metrics(self, pil_img):
-        img = np.array(pil_img)
-        return {"mean": float(np.mean(img)), "std": float(np.std(img)), "contrast": float(img.max() - img.min())}
-
-    def auto_invert(self, pil_img):
-        return np.mean(np.array(pil_img.convert('L'))) < 128
-
-    def extract_layout_regions(self, pil_img):
-        inputs = self.layout_processor(images=pil_img, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.layout_model(**inputs)
-        target_sizes = torch.tensor([pil_img.size[::-1]])
-        results = self.layout_processor.post_process_object_detection(
-            outputs, threshold=0.5, target_sizes=target_sizes
-        )[0]
-        regions = []
-        for box, label in zip(results["boxes"], results["labels"]):
-            if label in [5, 8, 9]:  # Table, text, title
-                xmin, ymin, xmax, ymax = map(int, box.tolist())
-                regions.append([xmin, ymin, xmax, ymax, int(label)])  # <-- Convert tuple to list
-        return regions
-
-    def crop_and_merge_regions(self, pil_img, regions):
-        crops = [pil_img.crop((xmin, ymin, xmax, ymax)) for (xmin, ymin, xmax, ymax, _) in regions]
-        if not crops:
-            return pil_img
-        widths, heights = zip(*(c.size for c in crops))
-        merged = Image.new("RGB", (max(widths), sum(heights)), "white")
-        y_offset = 0
-        for c in crops:
-            merged.paste(c, (0, y_offset))
-            y_offset += c.size[1]
-        return merged
-
-    def binarize_by_sentence(self, pil_img):
-        # Downscale image for OCR/drawing if very large
-        max_dim = 1500
-        scale = min(max_dim / pil_img.width, max_dim / pil_img.height, 1.0)
-        img = pil_img
-        if scale < 1.0:
-            img = pil_img.resize((int(pil_img.width * scale), int(pil_img.height * scale)), Image.LANCZOS)
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-        output = Image.new("RGB", img.size, "white")
-        draw = ImageDraw.Draw(output)
-        font_path = self.font_path
-        lines = {}
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            if int(data['conf'][i]) > 0 and data['text'][i].strip() != "":
-                line_num = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
-                if line_num not in lines:
-                    lines[line_num] = []
-                lines[line_num].append(i)
-        for line_indices in lines.values():
-            lefts = [data['left'][i] for i in line_indices]
-            tops = [data['top'][i] for i in line_indices]
-            rights = [data['left'][i] + data['width'][i] for i in line_indices]
-            bottoms = [data['top'][i] + data['height'][i] for i in line_indices]
-            left = min(lefts)
-            top = min(tops)
-            right = max(rights)
-            bottom = max(bottoms)
-            box_width = right - left
-            box_height = bottom - top
-            sentence = " ".join([data['text'][i] for i in line_indices])
-            font_size = max(int(box_height * 0.9), 18)
-            if font_path:
-                try:
-                    font = ImageFont.truetype(font_path, font_size)
-                except:
-                    font = self.font
-            else:
-                font = self.font
-            draw.rectangle([left, top, right, bottom], fill="black")
-            bbox = draw.textbbox((0, 0), sentence, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            x = left + max(0, (box_width - text_width) // 2)
-            y = top + max(0, (box_height - text_height) // 2)
-            draw.text((x, y), sentence, fill="white", font=font)
-        if scale < 1.0:
-            output = output.resize(pil_img.size, Image.LANCZOS)
-        return output
-
-    def process_single_page(
-        self, img_dict,
-        window_size=51, k=0.15,
-        force_binarization="sentence",
-        ocr_engine=None
-    ):
-        try:
-            img = img_dict['image']
-            page = img_dict['page']
-            denoised = self.denoise(img)
-            enhanced = self.enhance_contrast(denoised)
-            metrics = self.compute_quality_metrics(enhanced)
-            processed = self.binarize_by_sentence(enhanced)
-            bin_method = "sentence"
-            no_lines = self.remove_lines(processed)
-            deskewed = self.correct_skew(no_lines)
-            invert = self.auto_invert(deskewed)
-            if invert:
-                deskewed = self.invert_image(deskewed)
-            regions = self.extract_layout_regions(deskewed.convert("RGB"))
-            focused = self.crop_and_merge_regions(deskewed.convert("RGB"), regions)
-            final_metrics = self.compute_quality_metrics(focused)
-            ocr_results = {}
-            if ocr_engine is not None:
-                ocr_results["grayscale"] = ocr_engine(enhanced)
-                ocr_results["binarized"] = ocr_engine(processed)
-            # Remove non-serializable objects for API response
-            return {
-                "image": None,  # Remove PIL Image from response
-                "page": page,
-                "metrics": final_metrics,
-                "binarization": bin_method,
-                "inverted": invert,
-                "regions": regions,
-                "ocr_results": ocr_results if ocr_results else None
-            }
-        except Exception as e:
-            return {"image": None, "page": img_dict.get('page', '?'), "metrics": {}, "error": str(e)}
-
-    def preprocess(
-        self, input_path,
-        window_size=51, k=0.15,
-        force_binarization="sentence",
-        ocr_engine=None
-    ):
-        images = self.normalize_document(input_path)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
-            results = list(
-                executor.map(
-                    lambda img_dict: self.process_single_page(
-                        img_dict,
-                        window_size=window_size,
-                        k=k,
-                        force_binarization=force_binarization,
-                        ocr_engine=ocr_engine
-                    ),
-                    images
-                )
-            )
-        results.sort(key=lambda x: (str(x['page'])))
-        return results
-
-app = FastAPI(title="PreprocessAgent")
-agent = PreprocessAgent()
-
-@app.post("/preprocess")
-async def preprocess_endpoint(data: dict, user=Depends(verify_token)):
+        # Optionally, you can pre-populate other fields for automation
+    )
     try:
-        input_path = data["file_path"]
-        if not os.path.exists(input_path):
-            raise HTTPException(status_code=404, detail=f"File not found: {input_path}")
-        # Do your preprocessing here and save in the same directory
-        print(f"Preprocessing file: {input_path}")  # or use logging
-        # ... (preprocessing code that saves files, but does not return them)
-        return {"status": "done"}
+        result = workflow.invoke(initial_state)
+        logging.info("=== Workflow Complete ===")
+        logging.info("Final Workflow State:")
+        print(result)
     except Exception as e:
-        import traceback
-        print("⚠️ PreprocessAgent Error:", str(e))
-        traceback.print_exc()
+        logging.error(f"=== ERROR in Orchestrator ===\n{str(e)}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+import logging
+
+# Import your orchestrator workflow and WorkflowState
+from orchestrator import workflow, WorkflowState  # Make sure orchestrator.py is in your PYTHONPATH
+
+app = FastAPI(title="Orchestrator Service")
+
+class OrchestratorInput(BaseModel):
+    user_credentials: Dict[str, Any]
+    doc_type: Optional[str] = None
+    action: Optional[str] = None
+    uploaded_file_path: Optional[str] = None
+    document: Optional[Dict[str, Any]] = None  # <-- add this
+
+    # Add other fields as needed
+
+@app.post("/run_workflow")
+async def run_workflow(input_data: OrchestratorInput, request: Request):
+    try:
+        # Convert input to dict and fill initial state
+        initial_state = input_data.dict(exclude_unset=True)
+        # Extract the Authorization header (Bearer token)
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            initial_state["id_token"] = auth_header  # Keep full "Bearer ..." for agent forwarding
+        # Run the orchestrator workflow
+        result = workflow.invoke(initial_state)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        logging.error(f"Error running workflow: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("preprocess_agent:app", host="127.0.0.1", port=8005, reload=True)
 
 
 
@@ -772,790 +352,204 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import os
-from fastapi import Request, FastAPI
+import streamlit as st
+import requests
 from PIL import Image
-from dotenv import load_dotenv
-import pytesseract
-from transformers import pipeline
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import firebase_admin
-from firebase_admin import credentials, auth
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-
-load_dotenv()
-
-# Optional: Set Tesseract path, or ensure it's in PATH
-pytesseract.pytesseract.tesseract_cmd = "tesseract"
-
-# Load Hugging Face summarization pipeline with BART
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-
-def load_prompt(doc_type: str) -> str:
-    safe_doc_type = doc_type.lower().replace(' ', '_')
-    path = f"ExtractionAgent/prompts/{safe_doc_type}.txt"
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    return ""
-
-def extract_info(doc_type: str, image: Image.Image) -> dict:
-    # 1. OCR with Hindi and English
-    extracted_text = pytesseract.image_to_string(image, lang="eng+hin")
-    # 2. Load prompt text (optional, can be used as context)
-    prompt_text = load_prompt(doc_type)
-    full_text = f"{prompt_text}\n{extracted_text}" if prompt_text else extracted_text
-    # 3. Summarize/extract info using BART
-    summary = summarizer(full_text, max_length=256, min_length=30, do_sample=False)[0]['summary_text']
-    return {
-        "ocr_text": extracted_text,
-        "extracted_fields": summary
-    }
-
-app = FastAPI(title="ExtractionAgent")
-
-@app.post("/extract")
-async def extract_endpoint(data: dict, user=Depends(verify_token)):
-    try:
-        doc_type = data["doc_type"]
-        file_paths = data.get("file_paths")
-        if not file_paths:
-            raise HTTPException(status_code=400, detail="No file_paths provided.")
-        results = []
-        for idx, path in enumerate(file_paths):
-            try:
-                image = Image.open(path)
-                info = extract_info(doc_type, image)
-                info.update({"file_path": path, "page": idx + 1})
-                results.append(info)
-            except Exception as e:
-                results.append({"file_path": path, "error": str(e), "page": idx + 1})
-        return {"doc_type": doc_type, "results": results}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("extraction_agent:app", host="127.0.0.1", port=8007, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
-from typing import Dict, Any
-import pandas as pd
-from pathlib import Path
-import json
-import io
-from huggingface_hub import InferenceClient
-import traceback
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-app = FastAPI(title="Validation Agent (AI-powered)")
-
-reference_data = pd.DataFrame()
-hf_token = "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"  # Replace with your HuggingFace token
-
-# ---- Load reference.json at startup ----
-REFERENCE_PATH = "reference.json"  # Set your path here
-
-try:
-    with open(REFERENCE_PATH, "r") as f:
-        records = json.load(f)
-    reference_data = pd.DataFrame(records)
-    print(f"Loaded {len(reference_data)} reference records from {REFERENCE_PATH}.")
-except Exception as e:
-    print(f"Failed to load reference.json: {e}")
-    reference_data = pd.DataFrame()
-
-@app.post("/validate")
-async def validate_document(extracted: Dict[str, Any], user=Depends(verify_token)):
-    try:
-        global reference_data
-        if reference_data is None or reference_data.empty:
-            return {"valid": False, "reason": "Reference data is not loaded. Please upload it first."}
-        policy_id = extracted.get("policy_id")
-        if not policy_id:
-            return {"valid": False, "reason": "Missing 'policy_id' in extracted data."}
-        matches = reference_data[reference_data["policy_id"] == policy_id]
-        if matches.empty:
-            return {"valid": False, "reason": f"Claim ID '{policy_id}' not found in reference data."}
-        reference_record = matches.iloc[0].to_dict()
-
-        # Step 1: Field presence check
-        missing_fields = []
-        for key in reference_record.keys():
-            if key not in extracted or extracted[key] in [None, '', [], {}]:
-                missing_fields.append(key)
-        if missing_fields:
-            return {
-                "valid": False,
-                "missing_fields": missing_fields,
-                "message": "Extracted data is missing required fields."
-            }
-
-        # Step 2: LLM semantic validation
-        hf_client = InferenceClient("HuggingFaceH4/zephyr-7b-beta", token=hf_token)
-        prompt = (
-            "You are an expert insurance document validator. "
-            "Given the extracted claim data and the reference data, "
-            "decide if the document is valid. Consider all fields, context, and business logic. "
-            "Respond strictly in the format: VALID or INVALID, followed by a short reason.\n\n"
-            f"Extracted Data:\n{json.dumps(extracted, indent=2)}\n\n"
-            f"Reference Data:\n{json.dumps(reference_record, indent=2)}\n\n"
-            "Is this document valid?"
-        )
-        raw_response = hf_client.text_generation(prompt, max_new_tokens=100, temperature=0.0)
-        llm_verdict = raw_response.strip()
-        is_valid = "VALID" in llm_verdict.upper()
-        return {
-            "valid": is_valid,
-            "llm_verdict": llm_verdict,
-            "extracted_data": extracted,
-            "reference_data": reference_record
-        }
-    except Exception as e:
-        print("⚠️ Validation Error:")
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "Internal Server Error",
-                "details": str(e)
-            }
-        )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("validation_agent:app", host="127.0.0.1", port=8002, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import os
-import logging
-from fastapi import FastAPI, BackgroundTasks
-from pydantic import BaseModel, Field
-from typing import List
-from huggingface_hub import login
-from transformers import pipeline
-import chromadb
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-        
-# --- ADMIN-ONLY DEPENDENCY ---
-def admin_required(user=Depends(verify_token)):
-    role = user.get("role")
-    if role is None:
-        raise HTTPException(status_code=403, detail="Role information missing from token.")
-    if role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required.")
-    return user
 
 # --- CONFIGURATION ---
+ORCHESTRATOR_URL = "http://localhost:8000/run_workflow"
+AUTH_URL = "http://localhost:8001/login"
+SIGNUP_URL = "http://localhost:8001/signup"
 
-os.environ["HUGGINGFACEHUB_API_TOKEN"] = "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"
-login(token=os.environ["HUGGINGFACEHUB_API_TOKEN"])
+st.set_page_config(page_title="Insurance Doc Automation", layout="wide")
+st.title("📄 Insurance Document Automation Platform")
 
-chroma_client = chromadb.Client()
-COLLECTION_NAME = "insurance_embeddings"
-collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+# --- SESSION STATE ---
+if "stage" not in st.session_state: st.session_state.stage = "login"
+if "user" not in st.session_state: st.session_state.user = None
+if "id_token" not in st.session_state: st.session_state.id_token = None
+if "workflow_result" not in st.session_state: st.session_state.workflow_result = None
+if "uploaded_file_path" not in st.session_state: st.session_state.uploaded_file_path = None
+if "login_password" not in st.session_state: st.session_state.login_password = None
 
-# Load Hugging Face transformers pipeline for embeddings
-embedding_pipeline = pipeline("feature-extraction", model="thenlper/gte-small")
+# --- DASHBOARD 1: LOGIN/SIGNUP ---
+if st.session_state.stage == "login":
+    st.header("User Login / Signup")
+    tab1, tab2 = st.tabs(["Login", "Sign Up"])
+    with tab1:
+        username = st.text_input("Username or Email", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password_widget")
+        if st.button("Login"):
+            payload = {"identifier": username, "password": password}
+            resp = requests.post(AUTH_URL, json=payload)
+            if resp.ok:
+                user_info = resp.json()
+                st.session_state.user = user_info
+                st.session_state.id_token = user_info["idToken"]
+                st.session_state.login_password = password  # Store for workflow
+                st.success("Login successful!")
+                st.session_state.stage = "navigator"
+                st.rerun()
+            else:
+                st.error(resp.json().get("detail", "Login failed."))
+    with tab2:
+        signup_username = st.text_input("Username", key="signup_username")
+        signup_email = st.text_input("Email", key="signup_email")
+        signup_password = st.text_input("Password", type="password", key="signup_password")
+        signup_role = st.selectbox("Role", ["user", "admin"])
+        if st.button("Sign Up"):
+            payload = {
+                "email": signup_email,
+                "password": signup_password,
+                "role": signup_role,
+                "username": signup_username
+            }
+            resp = requests.post(SIGNUP_URL, json=payload)
+            if resp.ok:
+                st.success("Signup successful! Please log in.")
+            else:
+                st.error(resp.json().get("detail", "Signup failed."))
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+# --- DASHBOARD 2: NAVIGATOR ---
+elif st.session_state.stage == "navigator":
+    st.header("Navigator")
+    doc_type = st.selectbox("Document Type", ["claim", "policy", "report", "ID Proof", "Payment Receipt"])
+    action = st.selectbox("Action", ["Upload", "Review"]) if st.session_state.user.get("role") == "admin" else "Upload"
+    if st.button("Proceed to Intake"):
+        st.session_state.doc_type = doc_type
+        st.session_state.action = action
+        st.session_state.stage = "intake"
+        st.rerun()
 
-# --- FASTAPI SETUP ---
-
-app = FastAPI(title="Optimized Insurance Sync Agent API with ChromaDB Viewer")
-
-class ValidatedInsuranceData(BaseModel):
-    policy_id: str = Field(..., example="POL-123456")
-    customer_name: str = Field(..., example="Jane Doe")
-    claim_amount: float = Field(..., example=15000.0)
-    description: str = Field(..., example="Water damage to basement")
-    date_of_loss: str = Field(..., example="2025-06-01")
-    status: str = Field(..., example="approved") 
-
-class ValidatedRecord(BaseModel):
-    record_id: int = Field(..., example=1234)
-    validated_json: ValidatedInsuranceData
-
-class BatchValidatedRecords(BaseModel):
-    records: List[ValidatedRecord]
-
-# --- BATCH EMBEDDING GENERATION ---
-
-def batch_generate_embeddings(records: List[ValidatedRecord]):
-    texts = [rec.validated_json.json() for rec in records]
-    embeddings = []
-    for t in texts:
-        # The output is [ [ [768 floats], ... ] ] for a single text (batch size 1, sequence length, hidden size)
-        output = embedding_pipeline(t)
-        # Average over the sequence dimension (tokens) to get a single vector
-        vector = [float(sum(x)/len(x)) for x in zip(*output[0])]
-        embeddings.append(vector)
-    return embeddings
-
-# --- BACKGROUND SYNC TASK ---
-
-async def sync_records_to_chroma(records: List[ValidatedRecord], embeddings: List):
-    ids = []
-    metadatas = []
-    documents = []
-    failed_records = []
-
-    for idx, record in enumerate(records):
-        try:
-            ids.append(str(record.record_id))
-            metadatas.append({"record_id": record.record_id})
-            documents.append(record.validated_json.json())
-        except Exception as e:
-            logging.error(f"Error preparing record {record.record_id}: {e}")
-            failed_records.append(record.record_id)
-
-    try:
-        collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=documents
-        )
-        logging.info(f"Synced batch of {len(ids)} records to ChromaDB via API.")
-    except Exception as e:
-        logging.error(f"Error syncing batch records to ChromaDB: {e}")
-        # Retry logic or dead-letter queue could be added here
-        for i, record_id in enumerate(ids):
-            try:
-                collection.add(
-                    ids=[record_id],
-                    embeddings=[embeddings[i]],
-                    metadatas=[metadatas[i]],
-                    documents=[documents[i]]
-                )
-                logging.info(f"Retried and synced record {record_id} to ChromaDB.")
-            except Exception as ex:
-                logging.error(f"Failed to sync record {record_id} after retry: {ex}")
-
-# --- ASYNC BATCH ENDPOINT ---
-
-@app.post("/sync_batch")
-async def sync_batch_records(batch: BatchValidatedRecords, background_tasks: BackgroundTasks, user=Depends(verify_token)):
-    """
-    Receives a batch of validated insurance data, generates embeddings, and stores them in ChromaDB asynchronously.
-    """
-    try:
-        embeddings = batch_generate_embeddings(batch.records)
-        background_tasks.add_task(sync_records_to_chroma, batch.records, embeddings)
-        return {"status": "accepted", "synced_records": len(batch.records)}
-    except Exception as e:
-        logging.error(f"Error in batch sync request: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
-
-# --- PROTECTED ADMIN-ONLY ENDPOINT ---
-@app.get("/view_data")
-async def view_chromadb_data(limit: int = 20, user=Depends(admin_required)):
-    """
-    Admin-only: View all data stored in ChromaDB collection (documents, metadata, ids).
-    """
-    try:
-        results = collection.get(include=["metadatas", "documents"], limit=limit)
-        return results
-    except Exception as e:
-        logging.error(f"Error fetching data from ChromaDB: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# To run: uvicorn agents.sync_agent:app --reload
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("sync_agent:app", host="127.0.0.1", port=8003, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List
-from datetime import datetime
-import json
-import requests
-import os
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-
-app = FastAPI(title="Feedback Agent", description="Classifies and stores user feedback")
-
-# Hugging Face Token (Hardcoded for now; replace with secure method in production)
-hf_token = "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"  # Replace with your actual HF token
-
-# ----- Pydantic Schema -----
-class FeedbackInput(BaseModel):
-    username: str
-    rating: int
-    issue_text: str
-
-class FeedbackResponse(BaseModel):
-    username: str
-    rating: int
-    issue_text: str
-    classified_agent: str
-    issue_category: str
-    labels_scores: List[dict]
-    classified_at: str
-
-# ----- Classification Logic Using HF Inference API -----
-def classify_feedback(feedback: FeedbackInput) -> FeedbackResponse:
-    hf_url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-
-    candidate_labels = [
-        "authentication failed","login error","username not found","password mismatch","admin access error","timeout","Low response speed","cant open validation page",
-        "cant upload document", "document not accepted", "file not uploaded","file not supported","preview error","blurry image","id or data mismatch","Reference data missing"
-        "validation error","text extraction error","image extraction error","notifcation error","email failure","database error","sync failure","UI error","bad UI view"
-    ]
-
-    label_agent_map = {
-        "authentication failed": "authagent",
-        "login error": "authagent",
-        "username not found": "authagent",
-        "password mismatch": "authagent",
-        "admin access error": "navigatoragent",
-        "timeout": "navigatoragent",
-        "Low response speed": "navigatoragent",
-        "cant open validation page":"navigatoragent",
-        "cant upload document": "intakeagent",
-        "document not accepted": "intakeagent",
-        "file not uploaded": "intakeagent",
-        "file not supported": "intakeagent",
-        "preview error": "intakeagent",
-        "blurry image": "intakeagent",
-        "id or data mismatch": "validationagent",
-        "Reference data missing": "validationagent",
-        "validation error": "validationagent",
-        "text extraction error": "extractionagent",
-        "image extraction error": "extractionagent",
-        "notifcation error": "notifyagent",
-        "email failure": "notifyagent",
-        "database error": "syncagent",
-        "sync failure": "syncagent",
-        "UI error": "UI issue",
-        "bad UI view":"UI issue"
+# --- DASHBOARD 3: INTAKE (File Upload + Preview) ---
+elif st.session_state.stage == "intake":
+    st.header("Document Intake")
+    uploaded_file = st.file_uploader("Upload Document", type=["pdf", "jpg", "jpeg", "png", "txt", "docx"])
+    if uploaded_file:
+        files = {"files": (uploaded_file.name, uploaded_file.getbuffer())}
+        data = {
+            "document_type": st.session_state.doc_type,
+            "username": st.session_state.user["username"]
         }
+        headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+        upload_resp = requests.post("http://localhost:8004/upload_document", files=files, data=data, headers=headers)
+        if upload_resp.ok:
+            preview = upload_resp.json()["previews"][0]
+            st.session_state.uploaded_file_path = preview["file_path"]
+            st.session_state.intake_document = {
+                "file_path": preview["file_path"],
+                "doc_type": st.session_state.doc_type,
+                "metadata": {
+                    "username": st.session_state.user["username"],
+                    "document_type": st.session_state.doc_type
+                }
+            }
+            st.success(f"File uploaded: {uploaded_file.name}")
+            if uploaded_file.type.startswith("image"):
+                img = Image.open(uploaded_file)
+                st.image(img, caption="Preview of uploaded document", use_container_width=True)
+        else:
+            st.error(f"Upload error: {upload_resp.status_code} - {upload_resp.text}")
 
-    payload = {
-        "inputs": feedback.issue_text,
-        "parameters": {
-            "candidate_labels": candidate_labels,
-            "multi_label": True
+    if st.button("Start Workflow"):
+        if not st.session_state.get("intake_document"):
+            st.error("Please upload a document and wait for upload to complete.")
+        else:
+            payload = {
+                "user_credentials": {
+                    "identifier": st.session_state.user["username"],
+                    "password": st.session_state.get("login_password", "")
+                },
+                "doc_type": st.session_state.doc_type,
+                "action": st.session_state.action,
+                "document": st.session_state.intake_document
+            }
+            headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+            with st.spinner("Running workflow..."):
+                resp = requests.post(ORCHESTRATOR_URL, json=payload, headers=headers)
+                if resp.ok:
+                    st.session_state.workflow_result = resp.json()["result"]
+                    st.session_state.stage = "workflow"
+                    if "login_password" in st.session_state:
+                        del st.session_state["login_password"]
+                    st.rerun()
+                else:
+                    st.error(f"Error: {resp.status_code} - {resp.text}")
+
+# --- DASHBOARD 4: WORKFLOW PROGRESS & RESULTS ---
+elif st.session_state.stage == "workflow":
+    st.header("Document Processing Progress")
+    steps = ["Preprocessing", "Extracting", "Validating", "Syncing"]
+    for step in steps:
+        st.info(step)
+    st.success("Workflow complete! See results below.")
+    result = st.session_state.workflow_result
+    st.subheader("Validation Result")
+    st.json(result.get("validation_result", {}))
+    st.subheader("Notification")
+    st.info(result.get("notification", {}).get("message", "No notification."))
+    if st.button("View Feedback"):
+        st.session_state.stage = "feedback"
+        st.rerun()
+
+# --- DASHBOARD 5: FEEDBACK ---
+elif st.session_state.stage == "feedback":
+    st.header("Feedback")
+    result = st.session_state.workflow_result
+    val = result.get("validation_result", {})
+    if not val.get("valid", True):
+        st.warning(val.get("reason", "Validation failed."))
+    st.subheader("Submit Feedback")
+    issue_text = st.text_area("Describe your issue or feedback")
+    rating = st.slider("Rating", 1, 5, 3)
+    if st.button("Submit Feedback"):
+        feedback_payload = {
+            "username": st.session_state.user["username"],
+            "issue_text": issue_text,
+            "rating": rating
         }
-    }
+        headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+        feedback_resp = requests.post("http://localhost:8006/submit-feedback", json=feedback_payload, headers=headers)
+        if feedback_resp.ok:
+            st.success("Feedback submitted!")
+            st.json(feedback_resp.json())
+        else:
+            st.error(feedback_resp.json().get("detail", "Feedback error."))
+    if st.button("Restart Workflow"):
+        st.session_state.stage = "navigator"
+        st.session_state.workflow_result = None
+        st.rerun()
 
-    response = requests.post(hf_url, headers=headers, json=payload)
-    if response.status_code != 200:
-        raise Exception(f"HuggingFace API error: {response.status_code} - {response.text}")
+# --- ADMIN REVIEW (Optional) ---
+if st.session_state.user and st.session_state.user.get("role") == "admin":
+    st.sidebar.markdown("---")
+    if st.sidebar.button("Admin Review (View Synced Data)"):
+        st.session_state.stage = "admin_review"
+        st.rerun()
 
-    result = response.json()
-    top_3 = sorted(zip(result["labels"], result["scores"]), key=lambda x: x[1], reverse=True)[:3]
-
-    top_label = top_3[0][0]
-    agent = label_agent_map.get(top_label, "unknown")
-
-    labels_scores = [{"label": label, "score": score} for label, score in top_3]
-
-    return FeedbackResponse(
-        username=feedback.username,
-        rating=feedback.rating,
-        issue_text=feedback.issue_text,
-        classified_agent=agent,
-        issue_category=top_label,
-        labels_scores=labels_scores,
-        classified_at=datetime.now().isoformat()
-    )
-
-# ----- Endpoint to accept feedback -----
-@app.post("/submit-feedback", response_model=FeedbackResponse)
-async def submit_feedback(feedback: FeedbackInput, user=Depends(verify_token)):
+if st.session_state.stage == "admin_review":
+    st.header("Admin Review: Synced Data")
+    headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
     try:
-        classified = classify_feedback(feedback)
-
-        # Optional: Save to JSONL file
-        with open("feedback_log.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(classified.dict()) + "\n")
-
-        return classified
-
+        resp = requests.get("http://localhost:8003/view_data", headers=headers)
+        if resp.ok:
+            st.json(resp.json())
+        else:
+            st.warning("No synced data found or SyncAgent not running.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("feedbackagent:app", host="127.0.0.1", port=8006, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import os
-from fastapi import FastAPI
-from pydantic import BaseModel
-from transformers import pipeline
-import firebase_admin
-from firebase_admin import credentials, auth
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
-    firebase_admin.initialize_app(cred)
-
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-# Load Hugging Face summarization pipeline (BART)
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-
-def generate_summary(document_type: str, status: str, extracted_text: str) -> str:
-    # Fallback if extracted_text is empty
-    if not extracted_text:
-        extracted_text = "No additional details were provided."
-
-    status_lower = str(status).lower()
-
-    if status_lower in ["validated", "pending"]:
-        # For validated/pending, summarize details and prepend a positive message
-        summary = summarizer(
-            f"{document_type} status: {status}. {extracted_text}",
-            max_length=120, min_length=30, do_sample=False
-        )[0]['summary_text']
-        return f"Your {document_type} has been {status}. {summary}"
-    elif status_lower == "rejected":
-        # For rejected, summarize the rejection reason
-        summary = summarizer(
-            f"Rejection reason: {extracted_text}",
-            max_length=120, min_length=30, do_sample=False
-        )[0]['summary_text']
-        return f"Your {document_type} was rejected. {summary}"
-    else:
-        # For any other status, just summarize the details
-        summary = summarizer(
-            f"{document_type} status: {status}. {extracted_text}",
-            max_length=120, min_length=30, do_sample=False
-        )[0]['summary_text']
-        return summary
-
-class NotifyRequest(BaseModel):
-    document_type: str
-    status: str
-    extracted_text: str = ""
-
-app = FastAPI(title="NotifyAgent")
-
-@app.post("/notify")
-async def notify_endpoint(data: NotifyRequest, user=Depends(verify_token)):
-    try:
-        if not data.document_type or not data.status:
-            raise ValueError("Both 'document_type' and 'status' are required.")
-        result = generate_summary(
-            document_type=data.document_type,
-            status=data.status,
-            extracted_text=data.extracted_text
-        )
-        return {"message": result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("notify_agent:app", host="127.0.0.1", port=8008, reload=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        st.error(f"Error fetching synced data: {e}")
+    if st.button("Back to Workflow"):
+        st.session_state.stage = "workflow"
+        st.rerun()
+
+# --- FOOTER ---
+st.markdown("""
+---
+<small>
+Built with 🦙 Streamlit • Multi-Agent AI Orchestration • HuggingFace • ChromaDB • Firebase Auth
+</small>
+""", unsafe_allow_html=True)
 
 
 
