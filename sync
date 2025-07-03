@@ -1,0 +1,140 @@
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any, List
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
+from pydantic import BaseModel
+import chromadb
+import firebase_admin
+from firebase_admin import credentials, auth
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from transformers import pipeline
+
+# --- Firebase Setup ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    try:
+        decoded_token = auth.verify_id_token(credentials.credentials)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+def admin_required(user=Depends(verify_token)):
+    role = user.get("role")
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Role information missing from token.")
+    if role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    return user
+
+# --- Canonical Insurance Data Schema ---
+class ValidatedInsuranceData(BaseModel):
+    policy_id: str
+    customer_name: str
+    claim_amount: float
+    description: str
+    date_of_loss: str
+    status: str
+
+class ValidatedRecord(BaseModel):
+    record_id: int
+    validated_json: ValidatedInsuranceData
+
+class BatchValidatedRecords(BaseModel):
+    records: List[ValidatedRecord]
+
+# --- ChromaDB and Embedding Setup ---
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+COLLECTION_NAME = "insurance_embeddings"
+collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+embedding_pipeline = pipeline("feature-extraction", model="thenlper/gte-small")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+app = FastAPI(title="Orchestrator-Compatible Insurance Sync Agent")
+
+# --- Embedding Prompt ---
+def generate_embedding_text(validated_json: Dict[str, Any]) -> str:
+    prompt = (
+        f"Insurance Claim Semantic Embedding Prompt:\n"
+        f"You are creating a semantic embedding for an insurance claim record. Capture all key information for search and retrieval.\n\n"
+        f"Policy ID: {validated_json.get('policy_id')}\n"
+        f"Customer Name: {validated_json.get('customer_name')}\n"
+        f"Claim Amount: INR {validated_json.get('claim_amount')}\n"
+        f"Description: {validated_json.get('description')}\n"
+        f"Date of Loss: {validated_json.get('date_of_loss')}\n"
+        f"Status: {validated_json.get('status')}\n\n"
+        f"Summarize this record for semantic search and similarity comparison."
+    )
+    return prompt
+
+def generate_embedding(text: str) -> List[float]:
+    try:
+        output = embedding_pipeline(text)
+        vector = [float(sum(x)/len(x)) for x in zip(*output[0])]
+        return vector
+    except Exception as e:
+        logging.error(f"Embedding failed: {e}")
+        return [0.0] * 384  # fallback
+
+# --- Background Sync Task ---
+async def sync_records_to_chroma(records: List[ValidatedRecord], embeddings: List):
+    ids = []
+    metadatas = []
+    documents = []
+    for idx, record in enumerate(records):
+        ids.append(str(record.record_id))
+        metadatas.append({"record_id": record.record_id, "timestamp": datetime.now().isoformat()})
+        documents.append(record.validated_json.json())
+    try:
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents
+        )
+        logging.info(f"Synced batch of {len(ids)} records to ChromaDB.")
+    except Exception as e:
+        logging.error(f"Error syncing batch records to ChromaDB: {e}")
+
+# --- Main Batch Endpoint ---
+@app.post("/sync_batch")
+async def sync_batch_records(batch: BatchValidatedRecords, background_tasks: BackgroundTasks, user=Depends(verify_token)):
+    """
+    Receives a batch of validated insurance data, generates embeddings, and stores them in ChromaDB asynchronously.
+    """
+    try:
+        embedding_texts = [generate_embedding_text(rec.validated_json.dict()) for rec in batch.records]
+        embeddings = [generate_embedding(text) for text in embedding_texts]
+        background_tasks.add_task(sync_records_to_chroma, batch.records, embeddings)
+        return {"status": "accepted", "synced_records": len(batch.records)}
+    except Exception as e:
+        logging.error(f"Error in batch sync request: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Admin View Endpoint ---
+@app.get("/view_data")
+async def view_chromadb_data(limit: int = 20, user=Depends(admin_required)):
+    """
+    Admin-only: View all validated records stored in ChromaDB (documents, metadata, ids).
+    """
+    try:
+        results = collection.get(include=["metadatas", "documents", "ids"], limit=limit)
+        return results
+    except Exception as e:
+        logging.error(f"Error fetching data from ChromaDB: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "Sync Agent"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("sync_agent:app", host="127.0.0.1", port=8003, reload=True)
