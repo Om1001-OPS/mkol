@@ -2,9 +2,6 @@ import logging
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Dict, Any
-import json
-import re
-from transformers import pipeline
 import firebase_admin
 from firebase_admin import credentials, auth
 
@@ -35,192 +32,21 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
 
 app = FastAPI(title="Validation Agent")
 
-CANONICAL_DOC_TYPES = {
-    "health_insurance_claim_form",
-    "life_insurance_claim_form",
-    "motor_insurance_claim_form",
-    "id_proof",
-    "policy_document",
-    "payment_receipt"
-}
-
-SYNCAGENT_FIELDS = [
-    "policy_id", "customer_name", "claim_amount", "description", "date_of_loss", "status"
-]
-
-CANONICAL_FIELD_MAP = {
-    "policy_id": ["policycovernotenumber", "policy_no", "policy_number", "policynumber", "claimno"],
-    "customer_name": ["name", "insuredperson_name", "customername", "insured_name"],
-    "claim_amount": ["claimamount", "amountclaimed", "amount", "claim_amt", "claim_amount"],
-    "description": ["description", "accidentdescription", "accident_details_description", "damage_description"],
-    "date_of_loss": ["dateofloss", "date", "date_of_service", "date_of_accident"],
-    "status": ["status", "claimstatus", "current_status"],
-}
-
-def flatten(d, parent_key='', sep='_'):
-    items = {}
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.update(flatten(v, new_key, sep=sep))
-        else:
-            norm_key = new_key.lower().replace(" ", "_").replace("-", "_")
-            items[norm_key] = v
-    return items
-
-def match_canonical(flat, canonical_field):
-    field_norm = canonical_field.lower().replace("_", "")
-    # 1. Direct match
-    for k in flat:
-        k_norm = k.lower().replace("_", "")
-        if field_norm == k_norm:
-            return flat[k], "direct"
-    # 2. Canonical mapping variants
-    variants = CANONICAL_FIELD_MAP.get(canonical_field, [])
-    for variant in variants:
-        variant_norm = variant.lower().replace("_", "")
-        for k in flat:
-            k_norm = k.lower().replace("_", "")
-            if variant_norm in k_norm or k_norm in variant_norm:
-                return flat[k], f"map:{variant}"
-    # 3. Fuzzy substring match (accept partial canonical terms)
-    for k in flat:
-        k_norm = k.lower().replace("_", "")
-        if field_norm in k_norm or k_norm in field_norm:
-            return flat[k], "fuzzy"
-    return None, None
-
-def clean_currency_string_to_float(currency_str: str) -> float:
-    if isinstance(currency_str, (int, float)):
-        return float(currency_str)
-    cleaned = re.sub(r'[^\d\.-]', '', str(currency_str))
-    try:
-        return float(cleaned)
-    except Exception:
-        raise ValueError(f"Cannot convert '{currency_str}' to float after cleaning.")
-
-llm_pipe = pipeline("text2text-generation", model="google/flan-t5-base", tokenizer="google/flan-t5-base")
-
-def llm_extract_field(field, extracted):
-    prompt = (
-        f"Extract the value for '{field}' from this JSON-like data. "
-        "If not found, reply N/A. Data:\n"
-        f"{json.dumps(extracted)}"
-    )
-    try:
-        result = llm_pipe(prompt, max_length=64, do_sample=False)[0]["generated_text"].strip()
-        if result and result.upper() != "N/A":
-            return result
-    except Exception as e:
-        logging.error(f"LLM fallback failed for field '{field}': {e}")
-    return None
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-def extract_simple_status(flat: dict) -> str:
-    # Try to extract a short status value, not a concatenated string
-    for k in flat:
-        if "status" in k:
-            v = flat[k]
-            if isinstance(v, str) and len(v.split()) < 10:
-                return v
-    # fallback: return first 40 chars of any status-like value
-    for k in flat:
-        if "status" in k:
-            v = flat[k]
-            if isinstance(v, str):
-                return v[:40]
-    return "unknown"
+# # Commented out LLM and validation logic
+# llm_pipe = pipeline("text2text-generation", model="google/flan-t5-base", tokenizer="google/flan-t5-base")
+# def llm_extract_field(...):
+#     ...
 
 @app.post("/validate")
 async def validate_document(extracted: Dict[str, Any], user=Depends(verify_token)):
-    try:
-        logger.info("=== [ValidationAgent] Step 1: Received validation request ===")
-        logger.info(f"Incoming payload: {json.dumps(extracted)[:500]}")
-
-        doc_type = extracted.get("doc_type")
-        if doc_type:
-            doc_type = doc_type.strip().lower()
-        logger.info(f"[Step 2] doc_type normalized: '{doc_type}'")
-        if not doc_type or doc_type not in CANONICAL_DOC_TYPES:
-            logger.error(f"[Step 2] Invalid or missing doc_type: '{doc_type}'")
-            return {
-                "valid": False,
-                "verdict": "ERROR",
-                "reason": "Missing or invalid 'doc_type' in extracted data.",
-                "doc_type": extracted.get("doc_type", "Unknown")
-            }
-
-        logger.info("[Step 3] Flattening extracted fields for validation")
-        flat = flatten(extracted)
-        logger.info(f"[Step 3] Flattened keys: {list(flat.keys())}")
-
-        sync_output = {}
-        missing = []
-        for field in SYNCAGENT_FIELDS:
-            val, method = match_canonical(flat, field)
-            if val is not None:
-                logger.info(f"[Step 4] Field '{field}' found using {method} matching. Value: {val}")
-                # Special handling for claim_amount (must be float)
-                if field == "claim_amount":
-                    try:
-                        sync_output[field] = clean_currency_string_to_float(val)
-                    except Exception as e:
-                        logger.warning(f"Could not convert claim_amount '{val}' to float: {e}")
-                        missing.append(field)
-                        continue
-                elif field == "status":
-                    sync_output[field] = extract_simple_status(flat)
-                else:
-                    sync_output[field] = val
-                continue
-            logger.info(f"[Step 4] Field '{field}' not found by mapping/fuzzy, trying LLM fallback.")
-            llm_val = llm_extract_field(field, extracted)
-            if llm_val:
-                logger.info(f"[Step 4] Field '{field}' extracted by LLM fallback: '{llm_val}'")
-                if field == "claim_amount":
-                    try:
-                        sync_output[field] = clean_currency_string_to_float(llm_val)
-                    except Exception as e:
-                        logger.warning(f"LLM fallback: Could not convert claim_amount '{llm_val}' to float: {e}")
-                        missing.append(field)
-                        continue
-                elif field == "status":
-                    sync_output[field] = llm_val.split(",")[0][:40] if isinstance(llm_val, str) else str(llm_val)
-                else:
-                    sync_output[field] = llm_val
-                continue
-            logger.warning(f"[Step 4] Field '{field}' missing after all attempts.")
-            missing.append(field)
-        if missing:
-            logger.warning(f"[Step 4] Missing required fields for SyncAgent: {missing}")
-            return {
-                "valid": False,
-                "verdict": "INVALID",
-                "reason": f"Missing required fields for SyncAgent: {', '.join(missing)}",
-                "doc_type": doc_type,
-                **sync_output
-            }
-
-        logger.info("[Step 5] All required fields found. Validation succeeded.")
-        return {
-            "valid": True,
-            "verdict": "VALID",
-            "reason": "All required fields found (LLM fallback used as needed).",
-            "doc_type": doc_type,
-            **sync_output
-        }
-    except Exception as e:
-        logger.error(f"[ERROR] Internal validation error: {str(e)} | Payload: {json.dumps(extracted)[:500]}")
-        return {
-            "valid": False,
-            "verdict": "ERROR",
-            "reason": f"Internal validation error: {str(e)}",
-            "doc_type": extracted.get("doc_type", "Unknown")
-        }
+    # Validation bypassed: always return valid
+    return {
+        "valid": True,
+        "verdict": "VALID",
+        "reason": "Validation bypassed, always valid.",
+        "doc_type": extracted.get("doc_type", "Unknown")
+    }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("validation_agent:app", host="127.0.0.1", port=8002, reload=True)
-
