@@ -1,0 +1,141 @@
+import os
+import requests
+from google.cloud import firestore
+import firebase_admin
+from firebase_admin import credentials
+from fastapi import FastAPI, HTTPException
+import re
+from firebase_admin import credentials, auth
+
+# --- CONFIGURATION ---
+FIREBASE_API_KEY = "AIzaSyBLHn106tlG9gcmM0zfcYWZJ03dnWKb4yg"  # <-- Replace with your project's API key
+SERVICE_ACCOUNT_PATH = "firestore-key.json"  # Ensure this is in your project folder
+
+# --- INITIALIZE FIRESTORE & ADMIN SDK ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+    firebase_admin.initialize_app(cred)
+db = firestore.Client.from_service_account_json(SERVICE_ACCOUNT_PATH)
+
+# --- FIREBASE AUTH REST ENDPOINTS ---
+FIREBASE_AUTH_SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
+FIREBASE_AUTH_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+FIREBASE_AUTH_RESET_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
+
+# --- HELPERS ---
+
+def is_valid_username(username):
+    # Must contain both letters and numbers, and be at least 6 chars
+    return (
+        len(username) >= 6 and
+        re.search(r"[A-Za-z]", username) and
+        re.search(r"\d", username)
+    )
+
+def username_exists(username):
+    users = db.collection("users").where("username", "==", username).get()
+    return len(users) > 0
+
+def email_exists(email):
+    users = db.collection("users").where("email", "==", email).get()
+    return len(users) > 0
+def is_valid_mobile(mobile):
+    # Basic validation for Indian mobile numbers (10 digits, starts with 6-9)
+    return bool(re.fullmatch(r"[6-9]\d{9}", mobile))
+
+# --- FUNCTIONS ---
+def signup_user(email, password, role, username, mobile):
+    if not is_valid_username(username):
+        raise Exception("Username must contain both letters and numbers and be at least 6 characters.")
+    if username_exists(username):
+        raise Exception("Username already exists.")
+    if email_exists(email):
+        raise Exception("Email already exists.")
+    if len(password) < 6:
+        raise Exception("Password must be at least 6 characters long.")
+    if not is_valid_mobile(mobile):
+        raise Exception("Please enter a valid 10-digit mobile number starting with 6-9.")
+    # 1. Create user with Firebase Auth (REST API)
+    data = {
+        "email": email,
+        "password": password,
+        "returnSecureToken": True
+    }
+    r = requests.post(FIREBASE_AUTH_SIGNUP_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Signup failed"))
+    user = r.json()
+    uid = user["localId"]
+    # 2. Store role, username, and mobile in Firestore
+    db.collection("users").document(uid).set({
+        "role": role,
+        "email": email,
+        "username": username,
+        "mobile": mobile
+    })
+    return user
+
+def login_user(identifier, password):
+    # identifier can be email or username
+    if "@" in identifier:
+        email = identifier
+    else:
+        users = db.collection("users").where("username", "==", identifier).get()
+        if not users:
+            raise Exception("Username not found.")
+        email = users[0].to_dict()["email"]
+    data = {
+        "email": email,
+        "password": password,
+        "returnSecureToken": True
+    }
+    r = requests.post(FIREBASE_AUTH_SIGNIN_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Login failed"))
+    user = r.json()
+    uid = user["localId"]
+    doc = db.collection("users").document(uid).get()
+    user_info = doc.to_dict()
+    role = user_info.get("role") if user_info else "user"
+    username = user_info.get("username") if user_info else ""
+    mobile = user_info.get("mobile") if user_info else ""
+    return {
+        "idToken": user["idToken"],
+        "email": email,
+        "role": role,
+        "username": username,
+        "mobile": mobile
+    }
+
+def send_password_reset(email):
+    data = {
+        "requestType": "PASSWORD_RESET",
+        "email": email
+    }
+    r = requests.post(FIREBASE_AUTH_RESET_URL, json=data)
+    if r.status_code != 200:
+        raise Exception(r.json().get("error", {}).get("message", "Reset failed"))
+    return True
+
+app = FastAPI(title="AuthAgent")
+
+@app.post("/login")
+async def login(data: dict):
+    try:
+        result = login_user(data["identifier"], data["password"])
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/signup")
+async def signup(data: dict):
+    try:
+        # Now expects "mobile" in the payload
+        result = signup_user(data["email"], data["password"], data["role"], data["username"], data["mobile"])
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("auth_agent:app", host="127.0.0.1", port=8001, reload=True)
