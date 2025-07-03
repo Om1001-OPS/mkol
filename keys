@@ -1,0 +1,15 @@
+apiKey = "AIzaSyBLHn106tlG9gcmM0zfcYWZJ03dnWKb4yg"
+authDomain = "ai-auth-agent.firebaseapp.com"
+databaseURL = "https://ai-auth-agent-default-rtdb.firebaseio.com/"
+storageBucket = "ai-auth-agent.firebasestorage.app"
+
+AZURE_OPENAI_DEPLOYMENT_NAME_NOTIFY=gpt-4
+AZURE_OPENAI_API_VERSION_NOTIFY=2024-12-01-preview
+AZURE_OPENAI_API_KEY_NOTIFY=56wQ7JxMlAgdYRdZj8NHcYTWWPS6lBG3UR1vzbeWar6pDc0bmW3rJQQJ99BFACfhMk5XJ3w3AAABACOGfnG5
+AZURE_OPENAI_API_BASE_NOTIFY=https://pocaditya.openai.azure.com
+TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
+
+#notify_agent
+TWILIO_ACCOUNT_SID=ACf82f1ecb6eee76bcd6e00b9fdff2a6da
+TWILIO_AUTH_TOKEN=33043c3d03bc311dd6e3802d1ff720b6
+TWILIO_PHONE_NUMBER=+15179971260
