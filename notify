@@ -1,0 +1,247 @@
+import os
+import logging
+from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# LLM Imports (Azure OpenAI GPT-4)
+from langchain_community.chat_models import AzureChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+
+# Twilio SMS Import
+from twilio.rest import Client
+
+# Outlook Email Import (Windows-specific)
+import win32com.client as win32 # This will only work on Windows with Outlook installed
+
+import firebase_admin
+from firebase_admin import credentials, auth
+
+# --- Setup Logging ---
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# --- Load Environment Variables (do this early) ---
+load_dotenv()
+
+# --- Firebase Auth Setup ---
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate("firestore-key.json")  # Path to your service account
+        firebase_admin.initialize_app(cred)
+        logging.info("Firebase Admin SDK initialized successfully.")
+    except Exception as e:
+        logging.error(f"Failed to initialize Firebase Admin SDK: {e}. "
+                      "Ensure 'firestore-key.json' is present and valid in the project root.")
+        # Consider raising the error or exiting if Firebase is critical
+        # raise RuntimeError("Firebase initialization failed.")
+
+
+# --- FastAPI Security Scheme for Bearer Token ---
+security = HTTPBearer(auto_error=True)
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid token scheme (expected Bearer)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        logging.error(f"Invalid token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+        )
+
+
+# --- LLM Setup (Azure OpenAI GPT-4) ---
+llm = AzureChatOpenAI(
+    deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME_NOTIFY"),
+    openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION_NOTIFY"),
+    openai_api_key=os.getenv("AZURE_OPENAI_API_KEY_NOTIFY"),
+    openai_api_base=os.getenv("AZURE_OPENAI_API_BASE_NOTIFY"),
+    temperature=0.1 # A low temperature for more consistent summaries
+)
+
+# Prompt template for summary generation (updated for feedback thank you)
+summary_prompt_template = PromptTemplate.from_template("""
+You are a helpful assistant. Your task is to generate a concise, user-friendly summary of the following document status or user feedback.
+
+Document Type: {document_type}
+Status: {status}
+Details: {extracted_text}
+
+Instructions:
+1. If status is "validated", return a positive and reassuring message.
+2. If status is "rejected", clearly explain the rejection, mentioning any missing or invalid details.
+3. If this is feedback (indicated by 'issue_text' in Details), summarize the user's issue, acknowledge their input, and **thank them for their feedback**.
+4. Always write in a friendly, professional tone.
+5. Do not mention that you're an assistant or that this is a summary.
+6. Return only the summary. Do not repeat the instructions or structure.
+7. Return any money amount as INR.
+""")
+
+summary_chain = LLMChain(llm=llm, prompt=summary_prompt_template)
+
+def generate_summary_llm(document_type: str, status: str, extracted_text: str) -> str:
+    """Generates a summary using the LLMChain."""
+    try:
+        return summary_chain.run({
+            "document_type": document_type,
+            "status": status,
+            "extracted_text": extracted_text
+        }).strip()
+    except Exception as e:
+        logging.error(f"LLM summary generation failed: {e}", exc_info=True)
+        # Fallback summary if LLM fails
+        return f"Could not generate detailed summary for {document_type} with status {status}. Original details: {extracted_text}"
+
+# --- Notification Functions (Twilio for SMS, Outlook for Email) ---
+def send_sms(phone: str, message: str) -> str:
+    """Sends an SMS message via Twilio."""
+    try:
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        twilio_phone_number = os.getenv("TWILIO_PHONE_NUMBER")
+
+        if not all([account_sid, auth_token, twilio_phone_number]):
+            logging.warning("Twilio credentials not fully set up in .env. Skipping SMS.")
+            return "[SMS Not Sent: Twilio credentials missing or incomplete]"
+
+        client = Client(account_sid, auth_token)
+        client.messages.create(body=message, from_=twilio_phone_number, to=phone)
+        logging.info(f"SMS sent successfully to {phone}")
+        return f"SMS sent to {phone}"
+    except Exception as e:
+        logging.error(f"Failed to send SMS to {phone}: {e}", exc_info=True)
+        return f"Failed to send SMS: {e}"
+
+def send_email(to_email: str, subject: str, body: str) -> str:
+    """Sends an email via Microsoft Outlook (Windows-only)."""
+    try:
+        # Check if Outlook application is running
+        try:
+            outlook = win32.Dispatch("Outlook.Application")
+        except Exception:
+            logging.error("Microsoft Outlook application is not running or not installed.")
+            return "Failed to send email: Outlook application not running or installed."
+
+        mail = outlook.CreateItem(0) # 0 for olMailItem
+        mail.To = to_email
+        mail.Subject = subject
+        mail.Body = body
+        mail.Send()
+        logging.info(f"Email sent successfully to {to_email}")
+        return f"Email sent to {to_email}"
+    except Exception as e:
+        logging.error(f"Failed to send email to {to_email}: {e}", exc_info=True)
+        return f"Failed to send email: {e} (Note: Email functionality requires MS Outlook on Windows where this agent runs)"
+
+# --- FastAPI Setup ---
+app = FastAPI(title="NotifyAgent", description="Handles notifications via SMS and Email using LLM-generated summaries.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+class NotifyRequest(BaseModel):
+    document_type: str = ""
+    status: str = ""
+    extracted_text: str = ""
+    issue_text: str = "" # From Feedback Agent
+    username: str = ""   # From Feedback Agent
+    issue_category: str = "" # From Feedback Agent (if used)
+    method: str = "auto" # Changed to "auto" to imply sending both if possible
+    email: str = ""      # User's email
+    phone: str = ""      # User's phone number
+
+@app.post("/notify")
+async def notify(request_data: NotifyRequest, user=Depends(verify_token)): # Use Pydantic model for request body
+    notification_results = [] # List to store results for both methods
+    
+    try:
+        # Extract data from the Pydantic model
+        doc_type = request_data.document_type
+        status_val = request_data.status
+        extracted_text = request_data.extracted_text
+        issue_text = request_data.issue_text
+        username = request_data.username
+        issue_category = request_data.issue_category
+        # method = request_data.method.lower() # No longer needed for 'both' logic
+        user_email = request_data.email
+        user_phone = request_data.phone
+
+        # Prepare text for summary generation based on input type
+        summary_details = extracted_text
+        if issue_text: # If this is a feedback notification
+            doc_type = doc_type or "User Feedback" # Default document type for feedback
+            status_val = status_val or "Received" # Default status for feedback
+            summary_details = f"User '{username}' reported: {issue_text}"
+            if issue_category:
+                summary_details += f" (Category: {issue_category})"
+        elif not summary_details:
+            summary_details = "No specific details provided."
+        
+        # Generate summary using the LLM
+        message_summary = generate_summary_llm(
+            document_type=doc_type,
+            status=status_val,
+            extracted_text=summary_details # Use the prepared summary_details
+        )
+
+        # --- Attempt to send both Email and SMS ---
+        
+        # 1. Attempt Email Notification
+        if user_email:
+            email_res = send_email(user_email, f"Update on your {doc_type}: {status_val}", message_summary)
+            notification_results.append(f"Email: {email_res}")
+        else:
+            notification_results.append("Email: Skipped (no email address provided).")
+            logging.warning("Email notification skipped: No email address provided.")
+
+        # 2. Attempt SMS Notification
+        if user_phone:
+            sms_res = send_sms(user_phone, message_summary)
+            notification_results.append(f"SMS: {sms_res}")
+        else:
+            notification_results.append("SMS: Skipped (no phone number provided).")
+            logging.warning("SMS notification skipped: No phone number provided.")
+
+
+        # Consolidate results for the response
+        final_message = "; ".join(notification_results)
+
+        return {
+            "status": "success",
+            "message": final_message,
+            "summary": message_summary
+        }
+    except HTTPException as he:
+        # Re-raise HTTPExceptions as they contain specific status codes and details
+        raise he
+    except Exception as e:
+        logging.error(f"Unexpected error in notify endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Notification failed: {str(e)}")
+
+# --- Health Check Endpoint ---
+@app.get("/health")
+def health_check():
+    """Returns the health status of the Notify Agent."""
+    return {"status": "ok", "service": "Notify Agent"}
+
+# --- Uvicorn Run Configuration ---
+if __name__ == "__main__":
+    import uvicorn
+    # This allows you to run this agent directly for testing if needed
+    # Example: (venv) D:\FINALACCENTURE> python -m uvicorn agents.notify_agent:app --reload --port 8008
+    uvicorn.run("agents.notify_agent:app", host="0.0.0.0", port=8008, reload=True)
