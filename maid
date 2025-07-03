@@ -1,0 +1,251 @@
+import streamlit as st
+import requests
+from PIL import Image
+
+# --- CONFIGURATION ---
+ORCHESTRATOR_URL = "http://localhost:8000/run_workflow"
+AUTH_URL = "http://localhost:8001/login"
+SIGNUP_URL = "http://localhost:8001/signup"
+INTAKE_URL = "http://localhost:8004/upload_document"
+FEEDBACK_URL = "http://localhost:8006/submit-feedback"
+SYNC_VIEW_URL = "http://localhost:8003/view_data"
+
+# Canonical doc_type mapping
+doc_type_map = {
+    "Health Insurance Claim Form": "health_insurance_claim_form",
+    "Life Insurance Claim Form": "life_insurance_claim_form",
+    "Motor Insurance Claim Form": "motor_insurance_claim_form",
+    "ID Proof": "id_proof",
+    "Policy Document": "policy_document",
+    "Payment Receipt": "payment_receipt"
+}
+doc_type_id_label = {
+    "Health Insurance Claim Form": "Policy Number",
+    "Life Insurance Claim Form": "Policy Number",
+    "Motor Insurance Claim Form": "Policy Number",
+    "ID Proof": "ID Number",
+    "Policy Document": "Policy Number",
+    "Payment Receipt": "Receipt Number"
+}
+doc_type_options = list(doc_type_map.keys())
+
+st.set_page_config(page_title="Insurance Doc Automation", layout="wide")
+st.title("📄 Insurance Document Automation Platform")
+
+# --- SESSION STATE ---
+if "stage" not in st.session_state: st.session_state.stage = "login"
+if "user" not in st.session_state: st.session_state.user = None
+if "id_token" not in st.session_state: st.session_state.id_token = None
+if "workflow_result" not in st.session_state: st.session_state.workflow_result = None
+if "uploaded_file_path" not in st.session_state: st.session_state.uploaded_file_path = None
+if "login_password" not in st.session_state: st.session_state.login_password = None
+if "mobile" not in st.session_state: st.session_state.mobile = None
+
+# --- 1. LOGIN/SIGNUP ---
+if st.session_state.stage == "login":
+    st.header("User Login / Signup")
+    tab1, tab2 = st.tabs(["Login", "Sign Up"])
+    with tab1:
+        username = st.text_input("Username or Email", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password_widget")
+        if st.button("Login"):
+            payload = {"identifier": username, "password": password}
+            resp = requests.post(AUTH_URL, json=payload)
+            if resp.ok:
+                user_info = resp.json()
+                st.session_state.user = user_info
+                st.session_state.id_token = user_info["idToken"]
+                st.session_state.login_password = password
+                st.session_state.mobile = user_info.get("mobile", "")
+                st.success("Login successful!")
+                st.session_state.stage = "navigator"
+                st.rerun()
+            else:
+                st.error(resp.json().get("detail", "Login failed."))
+    with tab2:
+        signup_username = st.text_input("Username", key="signup_username")
+        signup_email = st.text_input("Email", key="signup_email")
+        signup_password = st.text_input("Password", type="password", key="signup_password")
+        signup_mobile = st.text_input("Mobile Number (10 digits)", key="signup_mobile")
+        signup_role = st.selectbox("Role", ["user", "admin"])
+        if st.button("Sign Up"):
+            payload = {
+                "email": signup_email,
+                "password": signup_password,
+                "role": signup_role,
+                "username": signup_username,
+                "mobile": signup_mobile
+            }
+            resp = requests.post(SIGNUP_URL, json=payload)
+            if resp.ok:
+                st.success("Signup successful! Please log in.")
+            else:
+                st.error(resp.json().get("detail", "Signup failed."))
+
+# --- 2. NAVIGATOR ---
+elif st.session_state.stage == "navigator":
+    st.header("Navigator")
+    doc_type_ui = st.selectbox("Select Document Type", doc_type_options, key="doc_type_select_form")
+    canonical_doc_type = doc_type_map[doc_type_ui]
+    id_label = doc_type_id_label[doc_type_ui]
+    doc_id = st.text_input(f"{id_label} (Optional, but recommended)", key="doc_id_input_form")
+    action = st.selectbox("Action", ["Upload", "Review"]) if st.session_state.user.get("role") == "admin" else "Upload"
+    if st.button("Proceed to Intake"):
+        st.session_state.doc_type = canonical_doc_type
+        st.session_state.action = action
+        st.session_state.doc_id = doc_id
+        st.session_state.id_label = id_label
+        st.session_state.stage = "intake"
+        st.rerun()
+
+# --- 3. INTAKE (File Upload + Preview) ---
+elif st.session_state.stage == "intake":
+    st.header("Document Intake")
+    uploaded_file = st.file_uploader("Upload Document", type=["pdf", "jpg", "jpeg", "png", "txt", "docx"])
+    if uploaded_file:
+        files = {"files": (uploaded_file.name, uploaded_file.getbuffer())}
+        data = {
+            "document_type": st.session_state.doc_type,  # Canonical doc_type
+            "username": st.session_state.user["username"],
+            "mobile": st.session_state.mobile or "",
+            "doc_id": st.session_state.doc_id or "",
+            "id_label": st.session_state.id_label or ""
+        }
+        headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+        upload_resp = requests.post(INTAKE_URL, files=files, data=data, headers=headers)
+        if upload_resp.ok:
+            preview = upload_resp.json()["previews"][0]
+            st.session_state.uploaded_file_path = preview["file_path"]
+            st.session_state.intake_document = {
+                "file_path": preview["file_path"],
+                "doc_type": st.session_state.doc_type,
+                "metadata": {
+                    "username": st.session_state.user["username"],
+                    "document_type": st.session_state.doc_type,
+                    "mobile": st.session_state.mobile or "",
+                    "doc_id": st.session_state.doc_id or "",
+                    "id_label": st.session_state.id_label or ""
+                }
+            }
+            st.success(f"File uploaded: {uploaded_file.name}")
+            if uploaded_file.type.startswith("image"):
+                img = Image.open(uploaded_file)
+                st.image(img, caption="Preview of uploaded document", use_container_width=True)
+        else:
+            st.error(f"Upload error: {upload_resp.status_code} - {upload_resp.text}")
+
+    if st.button("Start Workflow"):
+        if not st.session_state.get("intake_document"):
+            st.error("Please upload a document and wait for upload to complete.")
+        else:
+            payload = {
+                "user_credentials": {
+                    "identifier": st.session_state.user["username"],
+                    "password": st.session_state.get("login_password", "")
+                },
+                "doc_type": st.session_state.doc_type,
+                "action": st.session_state.action,
+                "document": st.session_state.intake_document,
+                "uploaded_file_path": st.session_state.uploaded_file_path,
+                "mobile": st.session_state.mobile or "",
+                "doc_id": st.session_state.doc_id or "",
+                "id_label": st.session_state.id_label or ""
+            }
+            headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+            with st.spinner("Running workflow..."):
+                resp = requests.post(ORCHESTRATOR_URL, json=payload, headers=headers)
+                if resp.ok:
+                    st.session_state.workflow_result = resp.json()["result"]
+                    st.session_state.stage = "workflow"
+                    if "login_password" in st.session_state:
+                        del st.session_state["login_password"]
+                    st.rerun()
+                else:
+                    st.error(f"Error: {resp.status_code} - {resp.text}")
+
+# --- 4. WORKFLOW PROGRESS & RESULTS ---
+elif st.session_state.stage == "workflow":
+    st.header("Document Processing Progress")
+    steps = ["Preprocessing", "Extracting", "Validating", "Syncing"]
+    for step in steps:
+        st.info(step)
+    st.success("Workflow complete! See results below.")
+    result = st.session_state.workflow_result
+    st.subheader("Validation Result")
+    st.json(result.get("validation_result", {}))
+    st.subheader("Notification")
+    st.info(result.get("notification", {}).get("message", "No notification."))
+    if st.button("View Feedback"):
+        st.session_state.stage = "feedback"
+        st.rerun()
+
+# --- 5. FEEDBACK ---
+elif st.session_state.stage == "feedback":
+    st.header("Feedback")
+    result = st.session_state.workflow_result
+    val = result.get("validation_result", {})
+    if not val.get("valid", True):
+        st.warning(val.get("reason", "Validation failed."))
+    st.subheader("Submit Feedback")
+    issue_text = st.text_area("Describe your issue or feedback")
+    rating = st.slider("Rating", 1, 5, 3)
+    if st.button("Submit Feedback"):
+        feedback_payload = {
+            "username": st.session_state.user["username"],
+            "issue_text": issue_text,
+            "rating": rating,
+            "mobile": st.session_state.mobile or ""
+        }
+        headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+        feedback_resp = requests.post(FEEDBACK_URL, json=feedback_payload, headers=headers)
+        if feedback_resp.ok:
+            st.success("Feedback submitted!")
+            st.session_state.workflow_result["feedback"] = feedback_resp.json()
+            st.session_state.stage = "notify"
+            st.rerun()
+        else:
+            st.error(feedback_resp.json().get("detail", "Feedback error."))
+    if st.button("Restart Workflow"):
+        st.session_state.stage = "navigator"
+        st.session_state.workflow_result = None
+        st.rerun()
+
+# --- 6. NOTIFICATION DASHBOARD ---
+elif st.session_state.stage == "notify":
+    st.header("Notification Dashboard")
+    notification = st.session_state.workflow_result.get("notification", {})
+    st.info(notification.get("summary", "No notification summary available."))
+    st.success(notification.get("message", "No notification sent."))
+    if st.button("Back to Home"):
+        st.session_state.stage = "navigator"
+        st.rerun()
+
+# --- ADMIN REVIEW (Optional) ---
+if st.session_state.user and st.session_state.user.get("role") == "admin":
+    st.sidebar.markdown("---")
+    if st.sidebar.button("Admin Review (View Synced Data)"):
+        st.session_state.stage = "admin_review"
+        st.rerun()
+
+if st.session_state.stage == "admin_review":
+    st.header("Admin Review: Synced Data")
+    headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+    try:
+        resp = requests.get(SYNC_VIEW_URL, headers=headers)
+        if resp.ok:
+            st.json(resp.json())
+        else:
+            st.warning("No synced data found or SyncAgent not running.")
+    except Exception as e:
+        st.error(f"Error fetching synced data: {e}")
+    if st.button("Back to Workflow"):
+        st.session_state.stage = "workflow"
+        st.rerun()
+
+# --- FOOTER ---
+st.markdown("""
+---
+<small>
+Built with 🦙 Streamlit • Multi-Agent AI Orchestration • HuggingFace • ChromaDB • Firebase Auth
+</small>
+""", unsafe_allow_html=True)
