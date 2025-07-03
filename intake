@@ -1,0 +1,110 @@
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import List, Dict
+import shutil
+import os
+import uuid
+import firebase_admin
+from firebase_admin import credentials, auth
+from fastapi import Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+        )
+
+app = FastAPI(title="IntakeAgent", description="Handles document intake and local storage")
+
+BASE_DIR = "uploaded_document"
+DOC_TYPES = {
+    "health_insurance_claim_form",
+    "life_insurance_claim_form",
+    "motor_insurance_claim_form",
+    "id_proof",
+    "policy_document",
+    "payment_receipt"
+}
+
+user_file_map: Dict[str, List[Dict]] = {}
+
+for doc_type in DOC_TYPES:
+    os.makedirs(os.path.join(BASE_DIR, doc_type), exist_ok=True)
+
+@app.post("/upload_document")
+async def upload_document(
+    files: List[UploadFile] = File(...),
+    document_type: str = Form(...),
+    username: str = Form(...),
+    mobile: str = Form(None),  # <-- Accept mobile here
+    user=Depends(verify_token)
+):
+    if document_type not in DOC_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid document type")
+
+    if username not in user_file_map:
+        user_file_map[username] = []
+
+    preview_objects = []
+
+    for file in files:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".pdf", ".jpg", ".jpeg", ".png", ".txt", ".docx"]:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
+
+        filename = f'{uuid.uuid4().hex}_{file.filename}'
+        dir_path = os.path.join(BASE_DIR, document_type)
+        os.makedirs(dir_path, exist_ok=True)
+        local_path = os.path.join(dir_path, filename)
+        with open(local_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        index = len(user_file_map[username]) + 1
+        user_file_map[username].append({
+            "index": index,
+            "filename": file.filename,
+            "local_path": local_path,
+            "document_type": document_type,
+            "mobile": mobile  # Store mobile with metadata
+        })
+
+        preview_objects.append({
+            "index": index,
+            "filename": file.filename,
+            "file_path": local_path  # This is what you pass to PreprocessAgent
+        })
+
+    return {
+        "message": f"{len(files)} files uploaded by {username} and saved locally.",
+        "previews": preview_objects
+    }
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to IntakeAgent. Upload your documents here."}
+
+@app.get("/user_map", summary="Full user-file map")
+def get_map():
+    return user_file_map
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("intake_agent:app", host="127.0.0.1", port=8004, reload=True)
