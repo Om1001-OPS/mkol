@@ -1,51 +1,28 @@
-import logging
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import Dict, Any
-import firebase_admin
-from firebase_admin import credentials, auth
-
-# --- Firebase Auth Setup ---
-if not firebase_admin._apps:
-    cred = credentials.Certificate("firestore-key.json")
-    firebase_admin.initialize_app(cred)
-
-security = HTTPBearer(auto_error=True)
-
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials or credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    try:
-        decoded_token = auth.verify_id_token(token)
-        return decoded_token
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
-        )
-
-app = FastAPI(title="Validation Agent")
-
-# # Commented out LLM and validation logic
-# llm_pipe = pipeline("text2text-generation", model="google/flan-t5-base", tokenizer="google/flan-t5-base")
-# def llm_extract_field(...):
-#     ...
-
 @app.post("/validate")
 async def validate_document(extracted: Dict[str, Any], user=Depends(verify_token)):
-    # Validation bypassed: always return valid
+    """
+    Always returns valid: True and a schema compatible with the sync agent.
+    """
+    # Extract or default all required fields for compatibility
+    validated_json = {
+        "policy_id": str(extracted.get("policy_id", "DUMMY_POLICY_ID")),
+        "customer_name": str(extracted.get("customer_name", "DUMMY_CUSTOMER")),
+        "claim_amount": float(extracted.get("claim_amount", 0.0)),
+        "description": str(extracted.get("description", "No description provided.")),
+        "date_of_loss": str(extracted.get("date_of_loss", "1970-01-01")),
+        "status": str(extracted.get("status", "unknown")),
+    }
     return {
         "valid": True,
         "verdict": "VALID",
         "reason": "Validation bypassed, always valid.",
-        "doc_type": extracted.get("doc_type", "Unknown")
+        "doc_type": extracted.get("doc_type", "Unknown"),
+        "validated_json": validated_json
     }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "Validation Agent"}
 
 if __name__ == "__main__":
     import uvicorn
