@@ -1,0 +1,245 @@
+import os
+import io
+import logging
+from datetime import datetime
+
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+from PIL import Image
+from dotenv import load_dotenv
+import pytesseract
+import json
+import re
+
+# LLM Imports (LangChain & Azure OpenAI)
+from langchain.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain.chains import LLMChain
+from langchain.chat_models import AzureChatOpenAI
+
+import firebase_admin
+from firebase_admin import credentials, auth
+
+# --- Firebase Auth Setup ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+        )
+
+load_dotenv()
+pytesseract.tesseract_cmd = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+llm = AzureChatOpenAI(
+    openai_api_key= "56wQ7JxMlAgdYRdZj8NHcYTWWPS6lBG3UR1vzbeWar6pDc0bmW3rJQQJ99BFACfhMk5XJ3w3AAABACOGfnG5",
+    openai_api_base= "https://pocaditya.openai.azure.com",
+    deployment_name= "gpt-4",
+    openai_api_version= "2024-12-01-preview",
+
+)
+
+def load_prompt_content(doc_type):
+    safe_doc_type = doc_type.lower().replace(' ', '_')
+    path = f"agents/prompts/{safe_doc_type}.txt"
+    if not os.path.exists(path):
+        logging.warning(f"Prompt file not found at {path}. Using generic extraction prompt.")
+        return "Extract all key information from the following document. Return as JSON."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+def extract_text_from_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in [".jpg", ".jpeg", ".png"]:
+            image = Image.open(path)
+            return pytesseract.image_to_string(image, lang="eng+hin")
+        elif ext == ".pdf":
+            import pdfplumber
+            text = ""
+            with pdfplumber.open(path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            return text
+        elif ext == ".txt":
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        elif ext == ".docx":
+            import docx
+            doc = docx.Document(path)
+            return "\n".join(p.text for p in doc.paragraphs)
+        else:
+            raise Exception(f"Unsupported file type: {ext}")
+    except Exception as e:
+        logging.error(f"Error extracting text from {path}: {e}")
+        raise
+
+def clean_llm_output(result_text):
+    # Remove Markdown code block if present
+    result_text = result_text.strip()
+    # Remove triple backtick code blocks (with or without language tag)
+    if result_text.startswith("```"):
+        result_text = re.sub(r"^```[a-zA-Z]*\n?", "", result_text)
+        result_text = re.sub(r"\n?```$", "", result_text)
+    return result_text.strip()
+
+#def extract_info(doc_type: str, extracted_text: str):
+#    logging.info("ExtractionAgent: Received OCR/text. Proceeding with LLM extraction.")
+#    if not extracted_text.strip():
+#        logging.error("ExtractionAgent: Pre-extracted text is empty or only whitespace. Cannot proceed with LLM extraction.")
+#        return {
+#            "doc_type": doc_type,
+#            "ocr_text": extracted_text,
+#            "extracted_fields": {"error": "No meaningful text provided for LLM extraction"}
+#        }
+#    system_prompt_content = load_prompt_content(doc_type)
+#    logging.info(f"ExtractionAgent: Loaded System Prompt Content (first 200 chars): {system_prompt_content[:200]}...")
+#   prompt = PromptTemplate.from_template(system_prompt_content)
+#    chat_template = ChatPromptTemplate.from_messages([
+#        SystemMessagePromptTemplate.from_template(system_prompt_content),
+#        HumanMessagePromptTemplate.from_template("Extracted Document Text:\n{extracted_text}\n")
+#    ])
+#    try:
+#        chain = LLMChain(llm=llm, prompt=chat_template)
+#        response = chain.invoke({"extracted_text": extracted_text})
+#        result_text = response['text']
+#        logging.info(f"ExtractionAgent: Raw LLM Output (first 500 chars): {result_text[:500]}...")
+#    except Exception as e:
+#        logging.error(f"ExtractionAgent: LLM invocation failed: {e}")
+#        return {
+#            "doc_type": doc_type,
+#            "ocr_text": extracted_text,
+#            "extracted_fields": {"error": f"LLM invocation failed: {str(e)}"}
+#        }
+#    try:
+#        cleaned = clean_llm_output(result_text)
+#        extracted_fields_dict = json.loads(cleaned)
+#        extracted_fields_dict["_doc_type_context"] = doc_type
+#        extracted_fields_dict["_ocr_text_raw"] = extracted_text
+#        logging.info("ExtractionAgent: Successfully parsed LLM output to JSON.")
+#    except json.JSONDecodeError as e:
+#        logging.error(f"ExtractionAgent: LLM did NOT return valid JSON. Error: {e}. Raw output: {result_text}")
+#        extracted_fields_dict = {
+#            "raw_llm_output": result_text,
+#            "json_parse_error": str(e),
+#            "doc_type_context": doc_type,
+#            "ocr_text_raw": extracted_text
+#        }
+#    return {
+#        "doc_type": doc_type,
+#        "ocr_text": extracted_text,
+#        "extracted_fields": extracted_fields_dict
+#    }
+#
+# ... (rest of your existing code, before extract_info) ...
+
+def extract_info(doc_type: str, extracted_text: str):
+    logging.info("ExtractionAgent: Received OCR/text. Proceeding with LLM extraction.")
+    if not extracted_text.strip():
+        logging.error("ExtractionAgent: Pre-extracted text is empty or only whitespace. Cannot proceed with LLM extraction.")
+        return {
+            "doc_type": doc_type,
+            "ocr_text": extracted_text,
+            "extracted_fields": {"error": "No meaningful text provided for LLM extraction"}
+        }
+    system_prompt_content = load_prompt_content(doc_type)
+    logging.info(f"ExtractionAgent: Loaded System Prompt Content (first 200 chars): {system_prompt_content[:200]}...")
+    prompt = PromptTemplate.from_template(system_prompt_content)
+    chat_template = ChatPromptTemplate.from_messages([
+        SystemMessagePromptTemplate.from_template(system_prompt_content),
+        HumanMessagePromptTemplate.from_template("Extracted Document Text:\n{extracted_text}\n")
+    ])
+    try:
+        chain = LLMChain(llm=llm, prompt=chat_template)
+        response = chain.invoke({"extracted_text": extracted_text})
+        result_text = response['text']
+        logging.info(f"ExtractionAgent: Raw LLM Output (first 500 chars): {result_text[:500]}...")
+    except Exception as e:
+        logging.error(f"ExtractionAgent: LLM invocation failed: {e}")
+        return {
+            "doc_type": doc_type,
+            "ocr_text": extracted_text,
+            "extracted_fields": {"error": f"LLM invocation failed: {str(e)}"}
+        }
+    try:
+        cleaned = clean_llm_output(result_text)
+        extracted_fields_dict = json.loads(cleaned)
+        extracted_fields_dict["_doc_type_context"] = doc_type
+        extracted_fields_dict["_ocr_text_raw"] = extracted_text
+        logging.info("ExtractionAgent: Successfully parsed LLM output to JSON.")
+
+        # --- TEMPORARY: Save extracted data to a file for review ---
+        # Create a directory for saved extractions if it doesn't exist
+        save_dir = "extracted_data_temp"
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"extracted_data_{doc_type}_{timestamp}.json"
+        save_path = os.path.join(save_dir, filename)
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(extracted_fields_dict, f, indent=4, ensure_ascii=False)
+        logging.info(f"ExtractionAgent: Saved extracted data to {save_path}")
+        # --- END TEMPORARY SECTION ---
+
+    except json.JSONDecodeError as e:
+        logging.error(f"ExtractionAgent: LLM did NOT return valid JSON. Error: {e}. Raw output: {result_text}")
+        extracted_fields_dict = {
+            "raw_llm_output": result_text,
+            "json_parse_error": str(e),
+            "doc_type_context": doc_type,
+            "ocr_text_raw": extracted_text
+        }
+    return {
+        "doc_type": doc_type,
+        "ocr_text": extracted_text,
+        "extracted_fields": extracted_fields_dict
+    }
+
+# ... (rest of the file) ...
+app = FastAPI(title="ExtractionAgent")
+
+@app.post("/extract")
+async def extract_endpoint(data: dict, user=Depends(verify_token)):
+    try:
+        doc_type = data["doc_type"]
+        file_paths = data.get("file_paths")
+        if not file_paths:
+            logging.error("ExtractionAgent: No file_paths provided in request.")
+            raise HTTPException(status_code=400, detail="No file_paths provided.")
+        results = []
+        for idx, path in enumerate(file_paths):
+            try:
+                extracted_text = extract_text_from_file(path)
+                info = extract_info(doc_type, extracted_text)
+                info.update({"file_path": path, "page": idx + 1})
+                results.append(info)
+            except Exception as e:
+                logging.error(f"ExtractionAgent: Error processing file {path}: {e}")
+                results.append({"file_path": path, "error": str(e), "page": idx + 1})
+        return {"doc_type": doc_type, "results": results}
+    except Exception as e:
+        logging.error(f"ExtractionAgent: Unexpected error during extract endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("extraction_agent:app", host="127.0.0.1", port=8007, reload=True)
