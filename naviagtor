@@ -1,0 +1,189 @@
+import os
+import logging
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from langchain_community.llms import HuggingFacePipeline
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from transformers import pipeline
+import firebase_admin
+from firebase_admin import credentials, auth
+
+# --- Firebase Auth Setup ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+        )
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# --- LLM Setup (Open Source, for fallback only) ---
+# Ensure 'google/flan-t5-base' model is downloaded or accessible.
+# This model can be large and might require sufficient RAM.
+try:
+    pipe = pipeline("text2text-generation", model="google/flan-t5-base", max_length=64, do_sample=False, temperature=0.1)
+    llm = HuggingFacePipeline(pipeline=pipe)
+except Exception as e:
+    logging.error(f"Failed to load HuggingFace pipeline model 'google/flan-t5-base': {e}")
+    logging.error("Navigator Agent will operate in a degraded mode without LLM fallback.")
+    # Provide a dummy LLM or handle this more gracefully if LLM is critical
+    llm = None # Set LLM to None if loading fails
+
+prompt = PromptTemplate(
+    template=(
+        "You are a Navigator Agent responsible for routing documents in an insurance workflow system.\n"
+        "Your task is to determine the NEXT AGENT based on the provided METADATA, following these rules strictly:\n\n"
+        "RULES:\n"
+        "1.  If 'Document Type' is missing or empty, the next agent is 'SelectDocument Type'.\n"
+        "2.  If 'User Role' is 'admin' AND 'Action' is 'review', the next agent is 'Sync Agent'.\n"
+        "3.  In all other cases (e.g., 'user' role, or 'admin' with 'upload' action, or any other valid document type), the next agent is 'Intake Agent'.\n\n"
+        "Respond ONLY with one of these exact phrases: 'Intake Agent', 'Sync Agent', or 'SelectDocument Type'.\n\n"
+        "### Examples:\n"
+        "Metadata:\n"
+        "Document Type: Health Insurance Claim\n"
+        "User Role: user\n"
+        "Action: upload\n"
+        "Response: Intake Agent\n\n"
+        "Metadata:\n"
+        "Document Type: Motor Insurance Policy\n"
+        "User Role: admin\n"
+        "Action: review\n"
+        "Response: Sync Agent\n\n"
+        "Metadata:\n"
+        "Document Type:\n"
+        "User Role: admin\n"
+        "Action: upload\n"
+        "Response: SelectDocument Type\n\n"
+        "Metadata:\n"
+        "Document Type: Life Insurance Form\n"
+        "User Role: admin\n"
+        "Action: upload\n"
+        "Response: Intake Agent\n\n" # Added an explicit admin upload example
+        "### Now process this:\n"
+        "Metadata:\n"
+        "Document Type: {doc_type}\n"
+        "User Role: {user_role}\n"
+        "Action: {action}\n"
+        "Response:"
+    ),
+    input_variables=["doc_type", "user_role", "action"]
+)
+chain = LLMChain(llm=llm, prompt=prompt) if llm else None # Only create chain if LLM loaded
+
+# --- LLM-only Routing Function ---
+def route_document(metadata: dict) -> str:
+    doc_type = metadata.get("doc_type", "").strip()
+    user_role = metadata.get("user_role", "").strip().lower()
+    action = metadata.get("action", "").strip().lower()
+    logging.info(f"Routing metadata (LLM-only): doc_type='{doc_type}', user_role='{user_role}', action='{action}'")
+
+    # --- LLM Routing ---
+    if not chain:
+        logging.error("LLM chain is not initialized. Cannot use LLM for routing. Falling back to default.")
+        return "SelectDocument Type" # Fallback if LLM failed to load
+
+    try:
+        llm_input = {
+            "doc_type": doc_type,
+            "user_role": user_role,
+            "action": action
+        }
+        llm_output = chain.run(llm_input).strip().split("\n")[0].strip()
+        logging.info(f"LLM raw output: '{llm_output}'")
+
+        valid_agents = {
+            "intake agent": "Intake Agent",
+            "sync agent": "Sync Agent",
+            "selectdocument type": "SelectDocument Type",
+            "select document type": "SelectDocument Type" # Handle variations
+        }
+        
+        # Normalize LLM output for matching
+        response_key = llm_output.lower().replace(" ", "")
+        for key, val in valid_agents.items():
+            if key.replace(" ", "") == response_key:
+                logging.info(f"LLM routed to: {val}")
+                return val
+        
+        logging.warning(f"LLM returned an unrecognized agent: '{llm_output}'. Falling back to SelectDocument Type.")
+        return "SelectDocument Type" # Fallback if LLM output is not one of the valid agents
+
+    except Exception as e:
+        logging.error(f"LLM routing failed: {e}", exc_info=True)
+        return "SelectDocument Type" # Final fallback if LLM call itself fails
+
+# --- FastAPI App ---
+app = FastAPI(title="NavigatorAgent")
+
+@app.post("/route")
+async def route(metadata: dict, user=Depends(verify_token)):
+    """
+    Receives document metadata and token, determines the next agent using LLM.
+    Expects: {
+        "doc_type": ...,
+        "user_role": ...,
+        "action": ...,
+        ... (other metadata)
+    }
+    """
+    try:
+        # User info from Firebase token
+        user_role = user.get("role", "user")
+        username = user.get("username", "")
+        email = user.get("email", "")
+        phone = user.get("mobile", "") or user.get("phone", "")  # Support both keys
+
+        # Extract document type and action from the request body
+        doc_type = metadata.get("doc_type", "").strip()
+        action = metadata.get("action", "").strip()
+
+        # Prepare metadata for routing
+        metadata_for_routing = {
+            "doc_type": doc_type,
+            "user_role": user_role,
+            "action": action
+        }
+        next_agent_decision = route_document(metadata_for_routing)
+
+        return {
+            "next_agent": next_agent_decision,
+            "user_data": {
+                "username": username,
+                "email": email,
+                "phone": phone,
+                "role": user_role
+            }
+        }
+    except Exception as e:
+        logging.error(f"Error in route endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "Navigator Agent"}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Make sure 'agents.navigator_agent:app' points to this file's app instance
+    uvicorn.run("agents.navigator_agent:app", host="0.0.0.0", port=8009, reload=True)
