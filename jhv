@@ -1,28 +1,8 @@
-def notify_agent_node(state: WorkflowState) -> WorkflowState:
-    logging.info("Calling NotifyAgent")
-    # Notification after feedback: use feedback data
-    issue_text = ""
-    if state.get("issue_text") and isinstance(state["issue_text"], dict):
-        issue_text = state["issue_text"].get("issue_text", "")
-    status_value = state["validation_result"].get("valid")
-    if status_value is True:
-        status_str = "validated"
-    elif status_value is False:
-        status_str = "rejected"
+def feedback_to_notify_condition(state: WorkflowState):
+    user_feedback = state.get("issue_text")
+    if user_feedback and isinstance(user_feedback, dict) and user_feedback.get("issue_text"):
+        return "notify"
     else:
-        status_str = str(status_value)
-    extracted_text = state["extracted_data"].get("ocr_text", "")
-    if not extracted_text:
-        extracted_text = state["validation_result"].get("reason", "")
-    payload = {
-        "document_type": state["doc_type"],
-        "status": status_str,
-        "extracted_text": extracted_text,
-        "phone": state.get("mobile", ""),
-        "issue_text": issue_text,
-        "username": state.get("username", ""),
-        "email": state.get("user", {}).get("email", "")
-    }
-    result = agent_post(AGENT_ENDPOINTS["notify"], "/notify", state=state, json=payload)
-    state['notification'] = result
-    return state
+        return None  # End workflow if no feedback
+
+graph.add_conditional_edges("feedback", feedback_to_notify_condition)
