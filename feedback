@@ -1,0 +1,145 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List
+from datetime import datetime
+import json
+import requests
+import os
+import firebase_admin
+from firebase_admin import credentials, auth
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")  # Path to your service account
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer error=\"invalid_token\""},
+        )
+
+
+app = FastAPI(title="Feedback Agent", description="Classifies and stores user feedback")
+
+# Hugging Face Token (Hardcoded for now; replace with secure method in production)
+hf_token = "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"  # Replace with your actual HF token
+
+# ----- Pydantic Schema -----
+class FeedbackInput(BaseModel):
+    username: str
+    rating: int
+    issue_text: str
+    mobile: str = None
+    
+class FeedbackResponse(BaseModel):
+    username: str
+    rating: int
+    issue_text: str
+    classified_agent: str
+    issue_category: str
+    labels_scores: List[dict]
+    classified_at: str
+
+# ----- Classification Logic Using HF Inference API -----
+def classify_feedback(feedback: FeedbackInput) -> FeedbackResponse:
+    hf_url = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+
+    candidate_labels = [
+        "authentication failed","login error","username not found","password mismatch","admin access error","timeout","Low response speed","cant open validation page",
+        "cant upload document", "document not accepted", "file not uploaded","file not supported","preview error","blurry image","id or data mismatch","Reference data missing"
+        "validation error","text extraction error","image extraction error","notifcation error","email failure","database error","sync failure","UI error","bad UI view"
+    ]
+
+    label_agent_map = {
+        "authentication failed": "authagent",
+        "login error": "authagent",
+        "username not found": "authagent",
+        "password mismatch": "authagent",
+        "admin access error": "navigatoragent",
+        "timeout": "navigatoragent",
+        "Low response speed": "navigatoragent",
+        "cant open validation page":"navigatoragent",
+        "cant upload document": "intakeagent",
+        "document not accepted": "intakeagent",
+        "file not uploaded": "intakeagent",
+        "file not supported": "intakeagent",
+        "preview error": "intakeagent",
+        "blurry image": "intakeagent",
+        "id or data mismatch": "validationagent",
+        "Reference data missing": "validationagent",
+        "validation error": "validationagent",
+        "text extraction error": "extractionagent",
+        "image extraction error": "extractionagent",
+        "notifcation error": "notifyagent",
+        "email failure": "notifyagent",
+        "database error": "syncagent",
+        "sync failure": "syncagent",
+        "UI error": "UI issue",
+        "bad UI view":"UI issue"
+        }
+
+    payload = {
+        "inputs": feedback.issue_text,
+        "parameters": {
+            "candidate_labels": candidate_labels,
+            "multi_label": True
+        }
+    }
+
+    response = requests.post(hf_url, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise Exception(f"HuggingFace API error: {response.status_code} - {response.text}")
+
+    result = response.json()
+    top_3 = sorted(zip(result["labels"], result["scores"]), key=lambda x: x[1], reverse=True)[:3]
+
+    top_label = top_3[0][0]
+    agent = label_agent_map.get(top_label, "unknown")
+
+    labels_scores = [{"label": label, "score": score} for label, score in top_3]
+
+    return FeedbackResponse(
+        username=feedback.username,
+        rating=feedback.rating,
+        issue_text=feedback.issue_text,
+        classified_agent=agent,
+        issue_category=top_label,
+        labels_scores=labels_scores,
+        classified_at=datetime.now().isoformat()
+    )
+
+# ----- Endpoint to accept feedback -----
+@app.post("/submit-feedback", response_model=FeedbackResponse)
+async def submit_feedback(feedback: FeedbackInput, user=Depends(verify_token)):
+    try:
+        classified = classify_feedback(feedback)
+
+        classified.mobile = feedback.mobile
+        with open("feedback_log.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(classified.dict()) + "\n")
+
+        return classified
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("feedbackagent:app", host="127.0.0.1", port=8006, reload=True)
