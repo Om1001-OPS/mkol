@@ -1,0 +1,215 @@
+import os
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import fitz
+import torch
+from fastapi import FastAPI, Depends, HTTPException
+from transformers import DetrImageProcessor, DetrForObjectDetection
+import pytesseract
+import firebase_admin
+from firebase_admin import credentials, auth
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any, List
+import requests
+import asyncio
+from uuid import uuid4
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+if not firebase_admin._apps:
+    cred = credentials.Certificate("firestore-key.json")
+    firebase_admin.initialize_app(cred)
+
+security = HTTPBearer(auto_error=True)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        decoded_token = auth.verify_id_token(credentials.credentials)
+        return decoded_token
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+class AIDocumentAgent:
+    def __init__(self):
+        # Use lightweight local LLM (Ollama)
+        self.ollama_url = "http://localhost:11434/api/generate"
+        self.model = "llama3.2:1b"  # Lightweight model
+
+        # Layout detection
+        self.layout_processor = DetrImageProcessor.from_pretrained("cmarkea/detr-layout-detection")
+        self.layout_model = DetrForObjectDetection.from_pretrained("cmarkea/detr-layout-detection")
+
+        # Font
+        try:
+            self.font = ImageFont.truetype("arial.ttf", 24)
+        except:
+            self.font = ImageFont.load_default()
+
+        # Ensure preprocessed_images directory exists
+        self.preprocessed_dir = "preprocessed_images"
+        os.makedirs(self.preprocessed_dir, exist_ok=True)
+
+    async def query_llm(self, prompt: str) -> Dict[str, Any]:
+        """Query local Ollama LLM with fallback"""
+        try:
+            response = requests.post(self.ollama_url, json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json"
+            }, timeout=10)
+            if response.status_code == 200:
+                result = response.json().get("response", "{}")
+                return json.loads(result)
+        except Exception as e:
+            logger.warning(f"Ollama LLM call failed: {e}")
+        # Fallback analysis
+        return {
+            "strategy": "standard",
+            "operations": ["denoise", "enhance", "deskew", "binarize"],
+            "confidence": 0.7
+        }
+
+    async def analyze_document(self, image: Image.Image) -> Dict[str, Any]:
+        """Quick AI analysis of document"""
+        img_array = np.array(image.convert('L'))
+        metrics = {
+            "brightness": float(np.mean(img_array)),
+            "contrast": float(img_array.max() - img_array.min()),
+            "size": image.size
+        }
+        prompt = f"""Analyze this document and recommend processing strategy.
+Brightness: {metrics['brightness']:.1f}, Contrast: {metrics['contrast']:.1f}
+Respond in JSON format:
+{{
+    "strategy": "minimal|standard|aggressive",
+    "operations": ["denoise", "enhance", "deskew", "binarize"],
+    "confidence": 0.8
+}}"""
+        return await self.query_llm(prompt)
+
+    def normalize_document(self, input_path: str) -> List[Dict]:
+        """Convert document to images"""
+        ext = os.path.splitext(input_path)[1].lower()
+        if ext == '.pdf':
+            doc = fitz.open(input_path)
+            return [{
+                'image': Image.frombytes("RGB", [p.get_pixmap(dpi=200).width, p.get_pixmap(dpi=200).height], p.get_pixmap(dpi=200).samples),
+                'page': i+1
+            } for i, p in enumerate(doc)]
+        elif ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+            img = Image.open(input_path).convert('RGB')
+            img.thumbnail((2000, 2000), Image.LANCZOS)
+            return [{'image': img, 'page': 1}]
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
+
+    def apply_processing(self, image: Image.Image, operations: List[str]) -> Image.Image:
+        """Apply processing operations efficiently"""
+        img = image.copy()
+        for op in operations:
+            if op == "denoise":
+                img_array = np.array(img.convert('L'))
+                denoised = cv2.fastNlMeansDenoising(img_array, None, 10, 7, 21)
+                img = Image.fromarray(denoised)
+            elif op == "enhance":
+                img_array = np.array(img.convert('L'))
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                enhanced = clahe.apply(img_array)
+                img = Image.fromarray(enhanced)
+            elif op == "deskew":
+                try:
+                    from deskew import determine_skew
+                    img_array = np.array(img.convert('L'))
+                    angle = determine_skew(img_array)
+                    if abs(angle) > 0.5:
+                        h, w = img_array.shape
+                        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+                        rotated = cv2.warpAffine(img_array, M, (w, h))
+                        img = Image.fromarray(rotated)
+                except Exception as e:
+                    logger.warning(f"Deskew failed: {e}")
+            elif op == "binarize":
+                img_array = np.array(img.convert('L'))
+                _, binary = cv2.threshold(img_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                img = Image.fromarray(binary)
+        return img
+
+    def compute_metrics(self, image: Image.Image) -> dict:
+        """Compute basic image quality metrics."""
+        img_array = np.array(image.convert('L'))
+        brightness = float(np.mean(img_array))
+        contrast = float(img_array.max() - img_array.min())
+        return {
+            "brightness": brightness,
+            "contrast": contrast,
+            "size": image.size
+        }
+
+    async def process_document(self, file_path: str) -> Dict[str, Any]:
+        """Main processing pipeline"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        images = self.normalize_document(file_path)
+        results = []
+        preprocessed_paths = []
+        for img_dict in images:
+            image = img_dict['image']
+            page = img_dict['page']
+            analysis = await self.analyze_document(image)
+            processed_image = self.apply_processing(image, analysis.get('operations', []))
+            original_metrics = self.compute_metrics(image)
+            final_metrics = self.compute_metrics(processed_image)
+
+            # --- Save preprocessed image ---
+            ext = ".jpg"
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            unique_id = uuid4().hex[:8]
+            save_name = f"{base_name}_preprocessed_p{page}_{unique_id}{ext}"
+            save_path = os.path.join(self.preprocessed_dir, save_name)
+            processed_image.save(save_path)
+            preprocessed_paths.append(save_path)
+
+            results.append({
+                "page": page,
+                "analysis": analysis,
+                "original_metrics": original_metrics,
+                "final_metrics": final_metrics,
+                "improvement": final_metrics["contrast"] - original_metrics["contrast"],
+                "preprocessed_image_path": save_path
+            })
+        return {
+            "file_path": file_path,
+            "total_pages": len(results),
+            "results": results,
+            "preprocessed_image_paths": preprocessed_paths,  # For audit/troubleshooting
+            "timestamp": datetime.now().isoformat()
+        }
+
+# FastAPI App
+app = FastAPI(title="AI Document Agent", description="Optimized AI document preprocessing")
+agent = AIDocumentAgent()
+
+@app.post("/preprocess")
+async def preprocess_endpoint(data: dict, user=Depends(verify_token)):
+    """Process document with AI analysis"""
+    try:
+        file_path = data.get("file_path")
+        if not file_path:
+            raise HTTPException(status_code=400, detail="file_path is required")
+        result = await agent.process_document(file_path)
+        return result
+    except Exception as e:
+        logger.error(f"Processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("preprocess_agent:app", host="127.0.0.1", port=8005, reload=True)
+
