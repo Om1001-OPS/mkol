@@ -1,17 +1,28 @@
-def feedback_agent_node(state: WorkflowState) -> WorkflowState:
-    logging.info("Calling FeedbackAgent")
-    user_feedback = state.get("issue_text")
-    if not user_feedback or not isinstance(user_feedback, dict) or not user_feedback.get("issue_text"):
-        logging.info("No explicit user feedback provided, skipping FeedbackAgent.")
-        return state
-    issue_text = user_feedback.get("issue_text")
-    rating = user_feedback.get("rating", 1)
+def notify_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling NotifyAgent")
+    # Notification after feedback: use feedback data
+    issue_text = ""
+    if state.get("issue_text") and isinstance(state["issue_text"], dict):
+        issue_text = state["issue_text"].get("issue_text", "")
+    status_value = state["validation_result"].get("valid")
+    if status_value is True:
+        status_str = "validated"
+    elif status_value is False:
+        status_str = "rejected"
+    else:
+        status_str = str(status_value)
+    extracted_text = state["extracted_data"].get("ocr_text", "")
+    if not extracted_text:
+        extracted_text = state["validation_result"].get("reason", "")
     payload = {
-        "username": state["username"],
+        "document_type": state["doc_type"],
+        "status": status_str,
+        "extracted_text": extracted_text,
+        "phone": state.get("mobile", ""),
         "issue_text": issue_text,
-        "rating": rating,
-        "mobile": state.get("mobile", "")
+        "username": state.get("username", ""),
+        "email": state.get("user", {}).get("email", "")
     }
-    result = agent_post(AGENT_ENDPOINTS["feedback"], "/submit-feedback", state=state, json=payload)
-    state['feedback_data'] = result
+    result = agent_post(AGENT_ENDPOINTS["notify"], "/notify", state=state, json=payload)
+    state['notification'] = result
     return state
