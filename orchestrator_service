@@ -1,0 +1,44 @@
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
+import logging
+
+# Import your orchestrator workflow and WorkflowState
+from orchestrator import workflow, WorkflowState  # Make sure orchestrator.py is in your PYTHONPATH
+
+app = FastAPI(title="Orchestrator Service")
+
+class OrchestratorInput(BaseModel):
+    user_credentials: Dict[str, Any]
+    doc_type: Optional[str] = None
+    action: Optional[str] = None
+    uploaded_file_path: Optional[str] = None
+    document: Optional[Dict[str, Any]] = None  
+    mobile: Optional[str] = None  
+    doc_id: Optional[str] = None      # <-- Add document/claim/policy/ID number
+    id_label: Optional[str] = None    # <-- Add label for the ID (e.g., Policy Number)
+    # Add other fields as needed
+
+@app.post("/run_workflow")
+async def run_workflow(input_data: OrchestratorInput, request: Request):
+    try:
+        # Convert input to dict and fill initial state
+        initial_state = input_data.dict(exclude_unset=True)
+        # Extract the Authorization header (Bearer token)
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            initial_state["id_token"] = auth_header  # Keep full "Bearer ..." for agent forwarding
+        # Run the orchestrator workflow
+        result = workflow.invoke(initial_state)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        logging.error(f"Error running workflow: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "Orchestrator Service"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("orchestrator_service:app", host="127.0.0.1", port=8000, reload=True)
