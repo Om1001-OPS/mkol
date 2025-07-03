@@ -1,8 +1,66 @@
-def feedback_to_notify_condition(state: WorkflowState):
-    user_feedback = state.get("issue_text")
-    if user_feedback and isinstance(user_feedback, dict) and user_feedback.get("issue_text"):
-        return "notify"
-    else:
-        return None  # End workflow if no feedback
+# --- 5. FEEDBACK ---
 
-graph.add_conditional_edges("feedback", feedback_to_notify_condition)
+elif st.session_state.stage == "feedback":
+    st.header("Feedback Dashboard")
+    result = st.session_state.workflow_result
+    val = result.get("validation_result", {})
+
+    if not val.get("valid", True):
+        st.warning(val.get("reason", "Validation failed."))
+
+    st.subheader("Submit Feedback")
+    issue_text = st.text_area("Describe your issue or feedback")
+    rating = st.slider("Rating", 1, 5, 3)
+
+    if st.button("Submit Feedback"):
+        feedback_payload = {
+            "username": st.session_state.user["username"],
+            "issue_text": issue_text,
+            "rating": rating,
+            "mobile": st.session_state.mobile or ""
+        }
+        headers = {"Authorization": f"Bearer {st.session_state.id_token}"}
+        with st.spinner("Submitting feedback..."):
+            # 1. Submit feedback to Feedback Agent
+            resp = requests.post(FEEDBACK_URL, json=feedback_payload, headers=headers)
+            if resp.ok:
+                st.success("Feedback submitted!")
+
+                # 2. Now trigger notification (call Notify Agent directly)
+                notify_payload = {
+                    "document_type": st.session_state.doc_type,
+                    "status": "feedback",  # or "Received"
+                    "extracted_text": "",  # You can add more context if needed
+                    "issue_text": issue_text,
+                    "username": st.session_state.user["username"],
+                    "email": st.session_state.user.get("email", ""),
+                    "phone": st.session_state.mobile or ""
+                }
+                NOTIFY_URL = "http://localhost:8008/notify"
+                notify_resp = requests.post(NOTIFY_URL, json=notify_payload, headers=headers)
+                if notify_resp.ok:
+                    st.session_state.workflow_result["notification"] = notify_resp.json()
+                else:
+                    st.session_state.workflow_result["notification"] = {"message": "Notification failed."}
+
+                st.session_state.stage = "notify"
+                st.rerun()
+            else:
+                st.error(resp.json().get("detail", "Feedback error."))
+
+    if st.button("Restart Workflow"):
+        st.session_state.stage = "navigator"
+        st.session_state.workflow_result = None
+        st.rerun()
+
+# --- 6. NOTIFICATION DASHBOARD ---
+
+elif st.session_state.stage == "notify":
+    st.header("Notification Dashboard")
+    notification = st.session_state.workflow_result.get("notification", {})
+    st.info(notification.get("summary", "No notification summary available."))
+    st.success(notification.get("message", "No notification sent."))
+
+    if st.button("Back to Home"):
+        st.session_state.stage = "navigator"
+        st.rerun()
