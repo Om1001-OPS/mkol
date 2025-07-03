@@ -1,0 +1,371 @@
+import os
+import logging
+from typing import TypedDict, Optional, Dict, Any, List
+import requests
+from langgraph.graph import StateGraph
+import json
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# --- Canonical doc_type values ---
+CANONICAL_DOC_TYPES = {
+    "health_insurance_claim_form",
+    "life_insurance_claim_form",
+    "motor_insurance_claim_form",
+    "id_proof",
+    "policy_document",
+    "payment_receipt"
+}
+
+AGENT_ENDPOINTS = {
+    "auth": os.getenv("AUTH_AGENT_URL", "http://localhost:8001"),
+    "navigator": os.getenv("NAVIGATOR_AGENT_URL", "http://localhost:8009"),
+    "intake": os.getenv("INTAKE_AGENT_URL", "http://localhost:8004"),
+    "preprocess": os.getenv("PREPROCESS_AGENT_URL", "http://localhost:8005"),
+    "extract": os.getenv("EXTRACTION_AGENT_URL", "http://localhost:8007"),
+    "validate": os.getenv("VALIDATION_AGENT_URL", "http://localhost:8002"),
+    "sync": os.getenv("SYNC_AGENT_URL", "http://localhost:8003"),
+    "feedback": os.getenv("FEEDBACK_AGENT_URL", "http://localhost:8006"),
+    "notify": os.getenv("NOTIFY_AGENT_URL", "http://localhost:8008"),
+}
+
+class WorkflowState(TypedDict, total=False):
+    user_credentials: Dict[str, Any]
+    user: Dict[str, Any]
+    id_token: Optional[str]
+    document: Optional[Dict[str, Any]]
+    preprocessed_data: Optional[Any]
+    extracted_data: Optional[Dict[str, Any]]
+    validation_result: Optional[Dict[str, Any]]
+    sync_status: Optional[Dict[str, Any]]
+    feedback_data: Optional[Dict[str, Any]]
+    notification: Optional[Dict[str, Any]]
+    uploaded_files: Optional[List[Any]]
+    next_agent: Optional[str]
+    user_role: Optional[str]
+    doc_type: Optional[str]
+    action: Optional[str]
+    username: Optional[str]
+    mobile: Optional[str]
+    doc_id: Optional[str]
+    id_label: Optional[str]
+
+def close_uploaded_files(files):
+    for _, file_tuple in files:
+        file_obj = file_tuple
+        if hasattr(file_obj, "close"):
+            file_obj.close()
+
+def agent_post(endpoint: str, path: str, state: Optional[WorkflowState] = None, **kwargs):
+    url = f"{endpoint}{path}"
+    headers = kwargs.pop("headers", {})
+    if state and "id_token" in state and state["id_token"]:
+        headers["Authorization"] = state["id_token"]
+    try:
+        logging.info(f"POST {url} | Payload: {kwargs.get('json') or kwargs.get('data') or kwargs.get('files')}")
+        resp = requests.post(url, headers=headers, **kwargs)
+        logging.info(f"Response [{resp.status_code}]: {resp.text}")
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logging.error(f"Error calling {url}: {e}")
+        raise
+
+def agent_get(endpoint: str, path: str, state: Optional[WorkflowState] = None, **kwargs):
+    url = f"{endpoint}{path}"
+    headers = kwargs.pop("headers", {})
+    if state and "id_token" in state and state["id_token"]:
+        headers["Authorization"] = state["id_token"]
+    try:
+        resp = requests.get(url, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logging.error(f"Error calling {url}: {e}")
+        raise
+
+def auth_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling AuthAgent")
+    payload = state['user_credentials']
+    user_info = agent_post(AGENT_ENDPOINTS["auth"], "/login", json=payload)
+    state['user'] = user_info
+    state['user_role'] = user_info.get("role")
+    state['username'] = user_info.get("username")
+    state['mobile'] = user_info.get("mobile", "")
+    state['id_token'] = f"Bearer {user_info.get('idToken')}"
+    return state
+
+def navigator_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling NavigatorAgent")
+    doc_type = state.get("doc_type")
+    if not doc_type or doc_type not in CANONICAL_DOC_TYPES:
+        raise Exception(f"doc_type missing or not canonical in state: got '{doc_type}'")
+    if not state.get("user_role"):
+        raise Exception("user_role missing in state")
+    if not state.get("action"):
+        state["action"] = "upload" if state["user_role"].lower() == "user" else "review"
+    payload = {
+        "doc_type": doc_type,
+        "user_role": state["user_role"].lower(),
+        "action": state["action"].lower()
+    }
+    result = agent_post(AGENT_ENDPOINTS["navigator"], "/route", state=state, json=payload)
+    state['next_agent'] = result.get('next_agent', 'Intake Agent')
+    return state
+
+def intake_agent_node(state: WorkflowState) -> WorkflowState:
+    if "document" in state and state["document"]:
+        return state
+    logging.info("Calling IntakeAgent")
+    if not state.get("uploaded_file_path"):
+        raise Exception("uploaded_file_path missing in state")
+    file_path = state["uploaded_file_path"]
+    files = [("files", (os.path.basename(file_path), open(file_path, "rb")))]
+    doc_type = state["doc_type"]
+    if doc_type not in CANONICAL_DOC_TYPES:
+        raise Exception(f"doc_type '{doc_type}' is not canonical.")
+    data = {
+        "document_type": doc_type,
+        "username": state["username"],
+        "mobile": state.get("mobile", ""),
+        "doc_id": state.get("doc_id", ""),
+        "id_label": state.get("id_label", "")
+    }
+    try:
+        result = agent_post(AGENT_ENDPOINTS["intake"], "/upload_document", state=state, files=files, data=data)
+        user_map = agent_get(AGENT_ENDPOINTS["intake"], "/user_map", state=state)
+        local_path = None
+        for user_files in user_map.get(state["username"], []):
+            if user_files["filename"] == os.path.basename(file_path):
+                local_path = user_files["local_path"]
+                break
+        if not local_path:
+            raise Exception("Uploaded file not found in user map")
+        state['document'] = {
+            "file_path": local_path,
+            "doc_type": doc_type,
+            "metadata": {
+                "username": state["username"],
+                "document_type": doc_type,
+                "mobile": state.get("mobile", ""),
+                "doc_id": state.get("doc_id", ""),
+                "id_label": state.get("id_label", "")
+            }
+        }
+        return state
+    finally:
+        close_uploaded_files(files)
+
+def preprocess_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info(f"Calling PreprocessAgent for file: {state['document']['file_path']}")
+    payload = {
+        "file_path": state["document"]["file_path"],
+        "doc_id": state.get("doc_id", ""),
+        "id_label": state.get("id_label", ""),
+        "doc_type": state["doc_type"]
+    }
+    result = agent_post(AGENT_ENDPOINTS["preprocess"], "/preprocess", state=state, json=payload)
+    state['preprocessed_data'] = result
+    logging.info("Preprocessing complete.")
+    return state
+
+def extraction_agent_node(state: WorkflowState) -> WorkflowState:
+    # Get the preprocessed image paths from the state
+    preprocessed_paths = state.get("preprocessed_data", {}).get("preprocessed_image_paths")
+
+    if not preprocessed_paths:
+        logging.error("Preprocessed image paths not found in state. Falling back to original document path if available.")
+        # Fallback to original if preprocessed data is missing, though this should ideally not happen
+        file_paths_for_extraction = [state['document']["file_path"]]
+    else:
+        file_paths_for_extraction = preprocessed_paths
+        logging.info(f"Calling ExtractionAgent for preprocessed files: {file_paths_for_extraction}")
+
+    doc_type = state["doc_type"]
+    if doc_type not in CANONICAL_DOC_TYPES:
+        raise Exception(f"doc_type '{doc_type}' is not canonical.")
+
+    payload = {
+        "file_paths": file_paths_for_extraction, # CHANGED: Use preprocessed paths
+        "doc_type": doc_type,
+        "doc_id": state.get("doc_id", ""),
+        "id_label": state.get("id_label", "")
+    }
+    result = agent_post(AGENT_ENDPOINTS["extract"], "/extract", state=state, json=payload)
+    # Defensive: Ensure doc_type is present in result
+    if "doc_type" not in result or result["doc_type"] != doc_type:
+        result["doc_type"] = doc_type
+    state['extracted_data'] = result
+    return state
+
+def validation_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling ValidationAgent")
+    extracted = state['extracted_data']
+    doc_type = extracted.get("doc_type")
+    fields = {}
+    results = extracted.get("results", [])
+    if results and "extracted_fields" in results[0]:
+        extracted_fields = results[0]["extracted_fields"]
+        if isinstance(extracted_fields, dict):
+            fields = extracted_fields
+        else:
+            # Try to parse if it's a string
+            try:
+                fields = json.loads(extracted_fields)
+            except Exception:
+                logging.warning("extracted_fields is not valid JSON. Validation will fail.")
+    else:
+        logging.error("No extracted_fields found in ExtractionAgent output.")
+
+    payload = {"doc_type": doc_type}
+    payload.update(fields)
+    if "doc_id" in state:
+        payload["doc_id"] = state["doc_id"]
+    if "id_label" in state:
+        payload["id_label"] = state["id_label"]
+
+    result = agent_post(AGENT_ENDPOINTS["validate"], "/validate", state=state, json=payload)
+    state['validation_result'] = result
+    return state
+
+def sync_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling SyncAgent")
+    validated_record = {
+        "record_id": 1,  # Use unique IDs in production
+        "validated_json": state.get("validation_result", {})
+    }
+    batch = {"records": [validated_record]}
+    result = agent_post(AGENT_ENDPOINTS["sync"], "/sync_batch", state=state, json=batch)
+    state['sync_status'] = result
+    return state
+
+def feedback_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling FeedbackAgent")
+    issue_text = str(state.get("validation_result", {}).get("errors", ""))
+    if not issue_text or issue_text == "[]":
+        issue_text = state.get("validation_result", {}).get("reason", "Unknown error")
+    if not issue_text:
+        issue_text = "Validation failed, but no error details were provided."
+    payload = {
+        "username": state["username"],
+        "issue_text": issue_text,
+        "rating": 1,
+        "mobile": state.get("mobile", "")
+    }
+    result = agent_post(AGENT_ENDPOINTS["feedback"], "/submit-feedback", state=state, json=payload)
+    state['feedback_data'] = result
+    return state
+
+def notify_agent_node(state: WorkflowState) -> WorkflowState:
+    logging.info("Calling NotifyAgent")
+
+    # Determine status string based on validation result
+    status_value = state.get("validation_result", {}).get("valid")
+    if status_value is True:
+        status_str = "validated"
+    elif status_value is False:
+        status_str = "rejected"
+    else:
+        status_str = str(status_value) # Fallback for unknown validation states
+
+    # Determine extracted_text for summary
+    # Prioritize feedback issue text if available
+    issue_text_from_feedback = state.get("feedback_data", {}).get("issue_text", "")
+    if issue_text_from_feedback:
+        # If there's specific feedback, use that as the primary detail for notification summary
+        summary_extracted_text = issue_text_from_feedback
+    else:
+        # Otherwise, use OCR text or validation reason
+        summary_extracted_text = state.get("extracted_data", {}).get("ocr_text", "")
+        if not summary_extracted_text:
+            summary_extracted_text = state.get("validation_result", {}).get("reason", "No specific details provided.")
+
+
+    payload = {
+        "document_type": state["doc_type"],
+        "status": status_str,
+        "extracted_text": summary_extracted_text, # Use the determined summary_extracted_text
+        "phone": state.get("mobile", ""),
+        "email": state.get("user", {}).get("email", ""), # Also pass user's email if available
+
+        # Pass full feedback details if available from the feedback_data state
+        "issue_text": state.get("feedback_data", {}).get("issue_text", ""),
+        "username": state.get("username", ""), # Username is directly from auth_agent
+        "issue_category": state.get("feedback_data", {}).get("issue_category", "")
+    }
+    result = agent_post(AGENT_ENDPOINTS["notify"], "/notify", state=state, json=payload)
+    state['notification'] = result
+    return state
+
+def sync_agent_review_node(state: WorkflowState) -> WorkflowState:
+    if state.get('user_role') != 'admin':
+        raise Exception("Admin access required for review.")
+    logging.info("Calling SyncAgent for Admin Review")
+    result = agent_get(AGENT_ENDPOINTS["sync"], "/view_data", state=state)
+    state['sync_status'] = result
+    return state
+
+# --- LangGraph Orchestration ---
+graph = StateGraph(WorkflowState)
+graph.add_node("auth", auth_agent_node)
+graph.add_node("navigator", navigator_agent_node)
+graph.add_node("intake", intake_agent_node)
+graph.add_node("preprocess", preprocess_agent_node)
+graph.add_node("extract", extraction_agent_node)
+graph.add_node("validate", validation_agent_node)
+graph.add_node("sync", sync_agent_node)
+graph.add_node("sync_review", sync_agent_review_node)
+graph.add_node("feedback", feedback_agent_node)
+graph.add_node("notify", notify_agent_node)
+
+graph.set_entry_point("auth")
+graph.add_edge("auth", "navigator")
+
+def nav_condition(state: WorkflowState):
+    agent = state.get("next_agent", "Intake Agent")
+    logging.info(f"NavigatorAgent next_agent: {agent}")
+    if agent == "Intake Agent":
+        return "intake"
+    elif agent == "Sync Agent":
+        return "sync_review"
+    elif agent == "SelectDocument Type":
+        logging.error("NavigatorAgent: Document type not selected. Stopping workflow.")
+        exit(1)
+    else:
+        logging.error(f"NavigatorAgent returned unknown next_agent: {agent}. Stopping workflow.")
+        exit(1)
+graph.add_conditional_edges("navigator", nav_condition)
+
+graph.add_edge("intake", "preprocess")
+graph.add_edge("preprocess", "extract")
+graph.add_edge("extract", "validate")
+
+def validation_condition(state: WorkflowState):
+    if state.get("validation_result", {}).get("valid"):
+        return "sync"
+    else:
+        return "feedback"
+graph.add_conditional_edges("validate", validation_condition)
+graph.add_edge("sync", "feedback") # <--- ADD THIS LINE
+graph.add_edge("feedback", "notify")
+
+# No further edge from sync_review (admin review is terminal)
+
+workflow = graph.compile()
+
+if __name__ == "__main__":
+    logging.info("=== Starting Orchestrator ===")
+    initial_state = WorkflowState(
+        user_credentials={
+            "identifier": input("Enter username/email: "),
+            "password": input("Enter password: ")
+        }
+        # Optionally, you can pre-populate other fields for automation
+    )
+    try:
+        result = workflow.invoke(initial_state)
+        logging.info("=== Workflow Complete ===")
+        logging.info("Final Workflow State:")
+        print(result)
+    except Exception as e:
+        logging.error(f"=== ERROR in Orchestrator ===\n{str(e)}")
